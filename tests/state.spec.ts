@@ -11,8 +11,8 @@ afterEach(async () => {
   await Promise.all(directories.splice(0).map(path => rm(path, { recursive: true, force: true })))
 })
 
-/** Permission-bit assertions are unreliable when the test runs as root. */
-const runningAsRoot = process.getuid?.() === 0
+/** chmod does not block reads/renames as root and is ignored on Windows. */
+const skipPermissionTests = process.getuid?.() === 0 || process.platform === 'win32'
 
 describe('state persistence', () => {
   it('round-trips non-secret configuration and bindings with a private file mode', async () => {
@@ -87,7 +87,25 @@ describe('state persistence', () => {
     expect(JSON.parse(await readFile(path, 'utf8'))).toMatchObject({ sessionId: 'session-shared' })
   })
 
-  it.skipIf(runningAsRoot)('propagates read I/O errors without quarantining the state file', async () => {
+  it('continues on the quarantined empty state when update runs before load', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'dfo-update-recovery-'))
+    directories.push(directory)
+    const path = join(directory, 'state.json')
+    await writeFile(path, '{bad json')
+    const store = new FileStateStore(path)
+    // The production path calls initialize() first, but a direct update() must
+    // not fail once the corrupt file has been quarantined; only a genuinely
+    // unreadable file (see the EACCES case above) keeps rejecting updates.
+    await expect(store.update(current => ({ ...current, sessionId: 'session-shared' })))
+      .resolves.toMatchObject({ sessionId: 'session-shared' })
+    expect(store.snapshot()).toMatchObject({ sessionId: 'session-shared' })
+    const quarantined = (await readdir(directory)).filter(name => name.startsWith('state.json.corrupt-'))
+    expect(quarantined).toHaveLength(1)
+    expect(await readFile(join(directory, quarantined[0] ?? ''), 'utf8')).toBe('{bad json')
+    expect(JSON.parse(await readFile(path, 'utf8'))).toMatchObject({ sessionId: 'session-shared' })
+  })
+
+  it.skipIf(skipPermissionTests)('propagates read I/O errors without quarantining the state file', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'dfo-io-error-'))
     directories.push(directory)
     const path = join(directory, 'state.json')
@@ -134,7 +152,7 @@ describe('state persistence', () => {
     expect((await stat(path)).isDirectory()).toBe(true)
   })
 
-  it.skipIf(runningAsRoot)('propagates a quarantine rename failure instead of starting empty', async () => {
+  it.skipIf(skipPermissionTests)('propagates a quarantine rename failure instead of starting empty', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'dfo-quarantine-failure-'))
     directories.push(directory)
     const path = join(directory, 'state.json')

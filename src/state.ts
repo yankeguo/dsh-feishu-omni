@@ -39,6 +39,13 @@ function isMissingFileError(error: unknown): boolean {
   return (error as { code?: unknown } | null)?.code === 'ENOENT'
 }
 
+/** The size failure is identical whether stat() or the actual read discovered it. */
+function oversizeError(path: string, actualBytes: number): StateFileError {
+  return new StateFileError(
+    `Feishu Omni state file is too large (${actualBytes} bytes; the limit is ${MAX_STATE_BYTES} bytes): ${path}; it was left untouched`,
+  )
+}
+
 function nonEmpty(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0
 }
@@ -163,7 +170,9 @@ export class FileStateStore implements StateStore {
   /**
    * Read the raw document, returning null when it does not exist. Only ENOENT is
    * translated; every other stat/read failure propagates unchanged so a valid
-   * file is never quarantined because of an I/O problem.
+   * file is never quarantined because of an I/O problem. The size is re-checked
+   * on the bytes actually read because the file can grow between stat() and the
+   * read; oversized data is still rejected, never parsed or quarantined.
    */
   private async readRaw(): Promise<string | null> {
     try {
@@ -171,12 +180,10 @@ export class FileStateStore implements StateStore {
       if (!info.isFile()) {
         throw new StateFileError(`Feishu Omni state path is not a regular file: ${this.path}`)
       }
-      if (info.size > MAX_STATE_BYTES) {
-        throw new StateFileError(
-          `Feishu Omni state file is too large (${info.size} bytes; the limit is ${MAX_STATE_BYTES} bytes): ${this.path}; it was left untouched`,
-        )
-      }
-      return await readFile(this.path, 'utf8')
+      if (info.size > MAX_STATE_BYTES) throw oversizeError(this.path, info.size)
+      const raw = await readFile(this.path)
+      if (raw.byteLength > MAX_STATE_BYTES) throw oversizeError(this.path, raw.byteLength)
+      return raw.toString('utf8')
     } catch (error) {
       if (isMissingFileError(error)) return null
       throw error
@@ -211,7 +218,16 @@ export class FileStateStore implements StateStore {
 
   update(mutator: (current: PersistedState) => PersistedState): Promise<PersistedState> {
     return (async () => {
-      if (!this.loaded) await this.load()
+      if (!this.loaded) {
+        try {
+          await this.load()
+        } catch (error) {
+          // A quarantined recovery leaves the store usable with an empty state, so
+          // a direct update() can continue on it (initialize() still surfaces the
+          // recovery to the UI). Every other load failure keeps propagating.
+          if (!(error instanceof StateRecoveryError)) throw error
+        }
+      }
       const result = this.queue.then(async () => {
         const next = normalizeState(mutator(this.current))
         const directory = dirname(this.path)

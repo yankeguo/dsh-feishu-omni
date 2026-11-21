@@ -13,8 +13,8 @@ afterEach(async () => {
   await Promise.all(directories.splice(0).map(path => rm(path, { recursive: true, force: true })))
 })
 
-/** Permission-bit assertions are unreliable when the test runs as root. */
-const runningAsRoot = process.getuid?.() === 0
+/** chmod does not block reads/renames as root and is ignored on Windows. */
+const skipPermissionTests = process.getuid?.() === 0 || process.platform === 'win32'
 
 function setup(initial = emptyState()) {
   const state = new MemoryStateStore(initial)
@@ -167,7 +167,7 @@ describe('OmniController', () => {
     await controller.close()
   })
 
-  it.skipIf(runningAsRoot)('fails initialization on state I/O errors instead of quarantining', async () => {
+  it.skipIf(skipPermissionTests)('fails initialization on state I/O errors instead of quarantining', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'dfo-controller-io-'))
     directories.push(directory)
     const path = join(directory, 'state.json')
