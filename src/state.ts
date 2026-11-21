@@ -15,6 +15,14 @@ export const emptyState = (): PersistedState => ({
   recentEventIds: [],
 })
 
+/** The corrupt file was preserved and the store is ready with an empty state. */
+export class StateRecoveryError extends Error {
+  constructor(quarantinePath: string, cause: unknown) {
+    super(`Feishu Omni state was corrupt; the original was moved to ${quarantinePath}; starting with empty state`, { cause })
+    this.name = 'StateRecoveryError'
+  }
+}
+
 function nonEmpty(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0
 }
@@ -115,7 +123,13 @@ export class FileStateStore implements StateStore {
         if (!info.isFile() || info.size > MAX_STATE_BYTES) throw new Error('Feishu Omni state file is too large')
         this.current = normalizeState(JSON.parse(await readFile(this.path, 'utf8')))
       } catch (error) {
-        if ((error as { code?: unknown }).code !== 'ENOENT') throw error
+        if ((error as { code?: unknown }).code !== 'ENOENT') {
+          const quarantinePath = `${this.path}.corrupt-${randomUUID()}`
+          await rename(this.path, quarantinePath)
+          this.current = emptyState()
+          this.loaded = true
+          throw new StateRecoveryError(quarantinePath, error)
+        }
       }
       this.loaded = true
     })

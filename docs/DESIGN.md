@@ -3,8 +3,8 @@
 ## 1. 调查基线
 
 - 运行中的桌面安装版由 `$DSH_INSTALL_DIR/package.json` 确认为 **DSH `0.2.2-rc.5`**。
-- 本机 `/Users/guoyk/Workspace/src/deepseek-harness` 克隆也声明 `0.2.2-rc.5`，HEAD 为 `2e39e70496aa02986ca6a820c5d497e816b69d7e`，但它已领先发布 tag，且若干文件与安装版哈希不同。因此插件签名以安装版源码为准，克隆只辅助定位。
-- 参考实现为 `@xmanrui/dsh-im@5.10.0`（克隆提交 `fc2ceab217309f8973afa03c58cdd8ff3e900130`）。只借鉴接入层，不沿用它的“每个 IM 会话一个 DSH Session”策略。
+- 插件签名与事件行为以该安装版 ASAR 内的实际源码为准；开发源码克隆只辅助定位，不作为发布版接口依据。
+- 参考实现为 `@xmanrui/dsh-im@5.10.0`。只借鉴接入层，不沿用它的“每个 IM 会话一个 DSH Session”策略。
 - 飞书 SDK 固定 `@larksuiteoapi/node-sdk@1.76.0`。官方当前长连接支持企业自建应用，桌面机只需出站公网，不需要公网回调。
 
 ## 2. 已核实的 DSH 扩展点
@@ -16,8 +16,8 @@
 - `sessionController.list({}, signal)`：列出 attached 和 persisted Session；`ctx.sessions.list()` 仅列 live，所以不采用后者做设置列表。
 - `sessionController.prompt({ requestId, sessionId, mode: 'queue', content }, signal)`：向任意普通既有 Session 投递。冷 Session 会 resume，可能返回 writer-held、migration-required 等错误；`accepted` 只表示 inbox admission，不表示模型执行完成。同一 `requestId` 重试会去重。
 - `origin: 'subagent'` 需要另一套 `subagents.prompt` 路由，MVP 明确排除，避免把不可续聊子会话误当普通 Session。
-- `ctx.on('session/event', …)`：提交后的持久事件流。只读取已有 `user/message`、`assistant/message`、`turn/end`，不发明插件 Session event type。
-- `assistant/message` 是 step 级，不是必然的 turn 最终答复。本实现按 `data.turn` 保存最后一条非空消息，在对应 `turn/end` 时广播。
+- `ctx.on('session/event', …, { global: true })`：显式订阅全局、提交后的持久事件流。只读取已有 `user/message`、`assistant/message`、`turn/end`，不发明插件 Session event type。
+- `assistant/message` 是 step 级，不是必然的 turn 最终答复。本实现按 `data.turn` 保存最后一条非空且 `data.interrupted !== true` 的消息，只在对应 `turn/end.reason` 为 `completed` 时广播。对象与字符串两种 reason 形式都支持；`aborted`、`blocked`、`error`、`max-tokens` 等其它结束原因一律不广播，避免把半截文本当成最终回复。
 - `user/message.data.source.kind === 'user'` 才是直接人类输入；relay、goal、team 和 DevLead 内部消息使用其它 source kind，不混入共享频道。
 
 主要安装版证据：`dsh-api-session-controller/src/index.ts`、`src/types.ts`、`dsh-session/src/index.ts`、`src/types.ts`（位于安装包 ASAR 内，只读访问）。
@@ -56,8 +56,9 @@
 绑定 Session 的 session/event
   → user/message(source.kind=user)
        飞书 requestId：原文广播；其它人类输入加 [DSH]
-  → assistant/message：按 turn 暂存最后一条非空文本
-  → turn/end：以 [助手] 前缀广播一次
+  → assistant/message：按 turn 暂存最后一条非空、未 interrupted 文本
+  → turn/end：仅 reason=completed 时以 [助手] 前缀广播一次；
+     aborted/blocked/error/max-tokens 等丢弃暂存文本
   → 每个收件人依次发送 im/v1/messages(receive_id_type=chat_id)
 ```
 
@@ -78,7 +79,7 @@ MVP 镜像：所有直接人类输入（飞书与 DSH Web）和 lead 的最终�
 - 入站和出站共享一个 FIFO，单个收件人也依次写入；多用户同时发言不会绕过这个队列。
 - 同一逻辑发送的 UUID 为 `dshfo_ + sha256(event key + chat_id)` 的前 40 个十六进制字符，总长度小于飞书 50 字符限制。重试复用 UUID，不同消息/收件人使用不同 UUID。
 - Session prompt admission 与飞书发送默认都最多 3 次尝试，退避 500ms、1s（上限 5s）；prompt 重试复用 DSH `requestId`。最终 admission 失败会向原发送者回一条错误提示。
-- 429、408、425、5xx 和网络错误可重试；普通 4xx 与认证终态不重试。
+- 429、408、425、5xx 和网络错误可重试；普通 4xx、认证终态和飞书业务码 `230002`（机器人不在目标会话）不重试。SDK 的非零响应会把业务 `code` 挂到 Error 上，供统一分类；其它未知业务码暂按可重试处理。
 - 发送失败保留绑定，继续下一个收件人；后续消息会再次尝试，所以重新把机器人加入会话后可恢复。状态显示最近脱敏错误。
 - 每次发送的 SDK `Client` 使用带 15 秒 timeout 和取消 signal 的独立 Axios 实例，所有 Client 共享一个 SDK token cache，按 appId 复用并提前刷新 tenant token；`WSClient` 负责自动重连和终态 `onError`。桥接另设 30 秒有界等待，停止时 AbortController 会取消 prompt、发送与退避，关闭操作同步阻止任何排队连接重新启动。
 - App ID 在保存时按 SDK 1.76.0 的实际规则校验：`cli_` 加 16 位十六进制字符，避免 SDK 只记录日志而 UI 永久停留在 connecting。插件显示 phase，终态可手动重新连接。
@@ -86,6 +87,8 @@ MVP 镜像：所有直接人类输入（飞书与 DSH Web）和 lead 的最终�
 ## 6. 持久化与 Secret
 
 `state.json` 只包含版本、App ID、Session ID、autoConnect、绑定和去重键。写入流程为：读取并校验 → 串行更新 → 同目录临时文件（0600）→ fsync → rename。
+
+点击“连接”时先持久化 `autoConnect=true`，而不是等待异步 WebSocket `onReady`：即使本次连接失败，下次启动也会重试；“断开”才清除该标记。若读取时发现 JSON、schema、版本或绑定损坏，原文件会改名为同目录的 `state.json.corrupt-*`，Store 以空状态就绪，控制器继续初始化并把 `StateRecoveryError` 脱敏呈现在 `lastError`。只有完成旁置的恢复错误会被初始化吞掉；其它 I/O 错误仍向上抛出。
 
 App Secret 仅存在于单次浏览器请求、Host 内存与 DSH credentials。控制器额外用当前 Secret 替换第三方错误消息中的出现次数；Client 保存成功立即清空输入，状态解析器没有 Secret 字段。测试包含 Secret 不出现在状态、RPC 和日志的负向用例。
 
@@ -101,6 +104,8 @@ App Secret 仅存在于单次浏览器请求、Host 内存与 DSH credentials。
 
 ## 8. 自动测试覆盖
 
-fake 测试覆盖：text/post 解析、非法事件、双键去重、prompt 失败重试、并发 FIFO、广播、turn 聚合、DSH/DevLead source 过滤、单收件人失败隔离、稳定 UUID 重试、永久 pending 请求取消、关闭时排队连接、状态原子保存/读取、并发状态更新、配置连接生命周期、Secret 脱敏、管理 envelope 校验、Client 两个设置 slot 与响应校验。另以真实 SDK `Client` / `WSClient` 加本地 Axios adapter（无网络）验证 tenant token、消息发送、WebSocket endpoint 和 `$return_headers` 的响应解包。
+fake 测试覆盖：text/post 解析、非法事件、双键去重、prompt 失败重试、并发 FIFO、广播、completed turn 聚合、interrupted 片段与非 completed turn 抑制、DSH/DevLead source 过滤、永久飞书业务码与单收件人失败隔离、稳定 UUID 重试、永久 pending 请求取消、关闭时排队连接、状态原子保存/读取、损坏状态旁置与控制器恢复、并发状态更新、配置连接生命周期、Secret 脱敏、管理 envelope 校验、Client 两个设置 slot 与响应校验。另以真实 SDK `Client` / `WSClient` 加本地 Axios adapter（无网络）验证 tenant token、消息发送、WebSocket endpoint 和 `$return_headers` 的响应解包。
+
+测试边界：`tests/host-adapters.spec.ts` 的 Cordis `Context` 和 Session Controller 全部是 mock，只验证本插件构造的 list/prompt 调用形状；安装版签名兼容性来自对目标 ASAR 源码的只读核对，不等同于真实 Host 集成测试。SDK 测试也只使用本地 HTTP adapter，不验证飞书实际权限、事件投递或 WebSocket 服务行为。
 
 不访问真实飞书，不安装到正在运行的 DSH，不读取真实 credentials，不依赖任何测试 Secret。

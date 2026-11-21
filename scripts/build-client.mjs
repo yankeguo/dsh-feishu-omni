@@ -13,7 +13,7 @@ const result = await build({
   target: ['chrome110', 'safari16', 'firefox110'],
   jsx: 'automatic',
   jsxImportSource: 'react',
-  external: ['react', 'react/jsx-runtime', 'react-dom', '@deepseek-ai/cordis', '@deepseek-ai/dsh-client-ui-slots'],
+  external: ['react', 'react/jsx-runtime', 'react-dom'],
   write: false,
   legalComments: 'none',
 })

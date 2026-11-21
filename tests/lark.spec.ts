@@ -64,6 +64,8 @@ describe('official Lark gateway', () => {
   it('rejects non-zero Feishu API responses', async () => {
     const fake = fakeSdk(230002)
     const gateway = createLarkGatewayFactory(fake.sdk)('cli_0123456789abcdef', 'secret-fixture', callbacks)
-    await expect(gateway.sendText('oc_chat', 'hello', 'uuid')).rejects.toThrow(/230002/)
+    const result = gateway.sendText('oc_chat', 'hello', 'uuid')
+    await expect(result).rejects.toThrow(/230002/)
+    await expect(result).rejects.toMatchObject({ code: 230002 })
   })
 })

@@ -30,10 +30,21 @@ export function publicError(error: unknown, now: () => Date, secrets: readonly s
 export function providerCode(error: unknown): number | undefined {
   if (typeof error !== 'object' || error === null) return undefined
   const record = error as { code?: unknown; response?: { data?: { code?: unknown } } }
-  const value = record.code ?? record.response?.data?.code
-  const code = Number(value)
-  return Number.isSafeInteger(code) && code !== 0 ? code : undefined
+  // Axios errors carry non-numeric `code`s (ERR_BAD_REQUEST, ECONNABORTED), so
+  // prefer the first candidate that actually reads as a provider business code.
+  for (const value of [record.code, record.response?.data?.code]) {
+    const code = Number(value)
+    if (Number.isSafeInteger(code) && code !== 0) return code
+  }
+  return undefined
 }
+
+const PERMANENT_PROVIDER_CODES = new Set([
+  230002, // The bot is outside the target chat; retrying cannot restore membership.
+  99991661,
+  99991663,
+  99991664,
+])
 
 export function isRetryable(error: unknown): boolean {
   if (typeof error === 'object' && error !== null) {
@@ -47,6 +58,6 @@ export function isRetryable(error: unknown): boolean {
   // SDK/API token errors are refreshed by the SDK itself. A surfaced auth error
   // is terminal for this attempt and must be fixed through Settings instead.
   const code = providerCode(error)
-  if (code === 99991661 || code === 99991663 || code === 99991664) return false
+  if (code !== undefined && PERMANENT_PROVIDER_CODES.has(code)) return false
   return true
 }

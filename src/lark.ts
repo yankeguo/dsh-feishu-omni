@@ -99,7 +99,9 @@ class OfficialFeishuGateway implements FeishuGateway {
         uuid,
       },
     })
-    if (response.code !== 0) throw new Error(`Feishu message create failed with code ${response.code}`)
+    if (response.code !== 0) {
+      throw Object.assign(new Error(`Feishu message create failed with code ${response.code}`), { code: response.code })
+    }
   }
 }
 

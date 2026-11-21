@@ -38,6 +38,6 @@ export async function apply(ctx: Context, rawConfig: Partial<Config> = {}): Prom
   })
   await controller.initialize()
   ctx.effect(() => registerManagementRoute(ctx, controller), 'feishu-omni: management route')
-  ctx.on('session/event', (session, event) => controller.sessionEvent(session.id, event))
+  ctx.on('session/event', (session, event) => controller.sessionEvent(session.id, event), { global: true })
   ctx.effect(() => async () => controller.close(), 'feishu-omni: close bridge')
 }

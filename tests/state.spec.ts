@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -44,14 +44,25 @@ describe('state persistence', () => {
     expect(store.snapshot()).toMatchObject({ appId: 'cli_0123456789abcdef', sessionId: 'session-shared', autoConnect: true })
   })
 
-  it('rejects corrupt or unsupported persisted data', async () => {
+  it('rejects corrupt or unsupported normalized data', () => {
     expect(() => normalizeState({ version: 2 })).toThrow(/unsupported version/)
     expect(() => normalizeState({ version: 1, bindings: [{}] })).toThrow(/invalid binding/)
+  })
+
+  it('quarantines a corrupt state file and starts with an empty usable store', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'dfo-corrupt-'))
     directories.push(directory)
     const path = join(directory, 'state.json')
     await writeFile(path, '{bad json')
-    await expect(new FileStateStore(path).load()).rejects.toThrow()
+    const store = new FileStateStore(path)
+    await expect(store.load()).rejects.toThrow(/moved.*starting with empty state/)
+    expect(store.snapshot()).toEqual(emptyState())
+    const files = await readdir(directory)
+    expect(files).toHaveLength(1)
+    expect(files[0]).toMatch(/^state\.json\.corrupt-/)
+    expect(await readFile(join(directory, files[0] ?? ''), 'utf8')).toBe('{bad json')
+    await store.update(current => ({ ...current, sessionId: 'session-shared' }))
+    expect(JSON.parse(await readFile(path, 'utf8'))).toMatchObject({ sessionId: 'session-shared' })
   })
 
   it('never requires or serializes a credential field', async () => {

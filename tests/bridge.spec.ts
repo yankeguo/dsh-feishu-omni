@@ -133,7 +133,7 @@ describe('OmniBridge outbound', () => {
   it('retries transient failures with the same uuid and isolates terminal recipients', async () => {
     const { bridge, gateway, errors, sleeps } = setup([alice, bob])
     gateway.failures.set('oc_alice', [new Error('timeout'), new Error('timeout')])
-    gateway.failures.set('oc_bob', [Object.assign(new Error('bot removed'), { response: { status: 403 } })])
+    gateway.failures.set('oc_bob', [Object.assign(new Error('bot removed'), { code: 230002 })])
     await bridge.sessionEvent(SESSION.sessionId, assistantEvent())
     await bridge.sessionEvent(SESSION.sessionId, turnEnd())
     await bridge.drain()
@@ -180,13 +180,37 @@ describe('OmniBridge outbound', () => {
     expect(gateway.sent.map(row => row.text)).toEqual(['[助手]\nfirst', '[助手]\nsecond'])
   })
 
-  it('broadcasts only the last non-empty assistant message of each turn', async () => {
+  it('broadcasts only the last non-empty assistant message of each completed turn', async () => {
     const { bridge, gateway } = setup([alice])
     await bridge.sessionEvent(SESSION.sessionId, assistantEvent(1, 'working', 7))
     await bridge.sessionEvent(SESSION.sessionId, assistantEvent(2, 'final answer', 7))
     await bridge.sessionEvent(SESSION.sessionId, turnEnd(3, 7))
     await bridge.drain()
     expect(gateway.sent.map(row => row.text)).toEqual(['[助手]\nfinal answer'])
+  })
+
+  it('does not broadcast an interrupted assistant fragment even when the turn completes', async () => {
+    const { bridge, gateway } = setup([alice])
+    await bridge.sessionEvent(SESSION.sessionId, assistantEvent(1, 'partial answer', 1, true))
+    await bridge.sessionEvent(SESSION.sessionId, turnEnd(2))
+    await bridge.drain()
+    expect(gateway.sent).toEqual([])
+  })
+
+  it.each(['aborted', 'blocked', 'error', 'max-tokens'])('does not broadcast assistant text for a %s turn', async kind => {
+    const { bridge, gateway } = setup([alice])
+    await bridge.sessionEvent(SESSION.sessionId, assistantEvent(1, 'incomplete answer'))
+    await bridge.sessionEvent(SESSION.sessionId, turnEnd(2, 1, { kind }))
+    await bridge.drain()
+    expect(gateway.sent).toEqual([])
+  })
+
+  it('accepts the string form of a completed turn reason', async () => {
+    const { bridge, gateway } = setup([alice])
+    await bridge.sessionEvent(SESSION.sessionId, assistantEvent(1, 'complete answer'))
+    await bridge.sessionEvent(SESSION.sessionId, turnEnd(2, 1, 'completed'))
+    await bridge.drain()
+    expect(gateway.sent.map(row => row.text)).toEqual(['[助手]\ncomplete answer'])
   })
 
   it('aborts a permanently stalled send so stop and the global queue finish', async () => {

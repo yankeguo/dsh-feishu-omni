@@ -2,6 +2,7 @@ import { OmniBridge } from './bridge.ts'
 import { publicError, safeMessage, silentLogger, type Logger } from './errors.ts'
 import type { ConfigureInput, ConnectionPhase, OmniStatus, PublicError, SessionOption, TestResult } from './public.ts'
 import { SerialQueue } from './serial.ts'
+import { StateRecoveryError } from './state.ts'
 import type {
   CredentialPort, FeishuGateway, GatewayFactory, SessionEventLike, SessionPort, StateStore,
 } from './types.ts'
@@ -36,7 +37,11 @@ export class OmniController {
   }
 
   async initialize(): Promise<void> {
-    const state = await this.options.state.load()
+    const state = await this.options.state.load().catch((error: unknown) => {
+      if (!(error instanceof StateRecoveryError)) throw error
+      this.rememberError(error)
+      return this.options.state.snapshot()
+    })
     this.phase = state.appId === null ? 'unconfigured' : 'disconnected'
     if (state.autoConnect) {
       void this.connect().catch(() => {

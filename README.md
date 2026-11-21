@@ -23,7 +23,7 @@
 - 首次单聊自动保存 `open_id + chat_id` 绑定；
 - 飞书输入以 `[飞书 · 发送者]` 前缀进入所选 Session；
 - DSH 网页中的人类输入以 `[DSH]` 前缀同步；
-- 每个 turn 的最后一条非空正式助手消息在 `turn/end` 后广播一次；
+- 每个 turn 的最后一条非空、未中断正式助手消息，仅在 `turn/end.reason` 为 `completed` 后广播一次；取消、失败、受阻和 `max-tokens` 截断的 turn 不广播；
 - `message_id + event_id` 双键持久去重、Session 事件去重、机器人消息防回环；
 - 全局 FIFO、指数退避、发送 API `uuid` 幂等、SDK 自动 tenant token 刷新；
 - 一个收件人失败不阻塞其他收件人，绑定保留以便重新加回机器人后恢复；
@@ -56,7 +56,11 @@ pnpm install
 pnpm build
 ```
 
-然后在 DSH 中打开 **Plugins → Add plugin**，选择这个仓库目录。该目录的 `package.json` 同时声明 Host bundle 与 Web Client；不要运行另一个 DSH 或 Web 服务。
+必须先执行上述安装和构建命令：`lib/` 被 `.gitignore` 排除，全新 clone 不含构建产物；不构建会在插件激活时因无法 import `lib/index.js` 而失败。
+
+然后在 DSH 中打开 **Plugins → Add plugin**，在插件 **spec 文本框**中粘贴这个仓库目录的**绝对路径**（例如 `/Users/name/dsh-feishu-omni`），不要使用相对路径；这个版本没有目录选择器。该目录的 `package.json` 同时声明 Host bundle 与 Web Client；不要运行另一个 DSH 或 Web 服务。
+
+首次安装可能因 `@larksuiteoapi/node-sdk` 的传递依赖 `protobufjs` 报 `ERR_PNPM_IGNORED_BUILDS`，安装对话框会显示“有依赖的安装脚本需要你允许后才能继续”并列出待批准的脚本。点击**“允许这些脚本并重试”**即可继续；不要为此修改依赖版本。
 
 ### 配置
 
@@ -64,7 +68,7 @@ pnpm build
 
 1. 填飞书官方术语所示的 **App ID / App Secret**。Secret 输入框遮罩；保存后输入框清空，留空表示保留已保存 Secret。
 2. 点击刷新，从列表选择一个普通 DSH Session。列表包含已加载和持久化的冷 Session，排除 `origin: subagent`。
-3. 保存配置，点击**连接**。状态会显示连接中、已连接或最近错误；连接成功后会记住自动连接。
+3. 保存配置，点击**连接**。状态会显示连接中、已连接或最近错误；点击连接时就会记住自动连接，因此即使本次连接随后失败，下次启动 DSH 也会重试。
 4. 让第一位飞书用户私聊机器人一句话，自动建立绑定。之后可用“发送测试消息”检查所有绑定用户的投递。
 5. 其他用户分别私聊机器人，即加入同一个共享消息流。
 
@@ -104,7 +108,7 @@ pnpm run verify
 
 ## 持久化与隐私
 
-- 非秘密配置、绑定和最近去重键：`$DSH_HOME/integrations/dsh-feishu-omni/state.json`（未设置 `DSH_HOME` 时为 `~/.dsh/...`）。写入采用临时文件原子替换，文件权限 `0600`。
+- 非秘密配置、绑定和最近去重键：`$DSH_HOME/integrations/dsh-feishu-omni/state.json`（未设置 `DSH_HOME` 时为 `~/.dsh/...`）。写入采用临时文件原子替换，文件权限 `0600`。若该文件损坏，插件会把原文件改名为旁边的 `state.json.corrupt-*`，以空状态启动，并在设置页的最近错误中显示恢复信息；原文件不会直接删除。
 - App Secret：DSH credentials 引用 `DSH_FEISHU_OMNI_APP_SECRET`，由本机 DSH credential provider 保存。
 - 管理 RPC 复用 DSH 已认证的 `/api` 通道，不新增端口，不读取或重写 profile 的 `cordis.patch.yml`。
 - 仓库、测试夹具、状态响应和插件日志均不应包含真实 Secret。
@@ -114,13 +118,15 @@ pnpm run verify
 自动测试不访问真实飞书，也不安装到当前运行中的 DSH。请人工执行：
 
 - [ ] `pnpm install && pnpm run verify` 全部通过。
+- [ ] 在全新 clone 中先执行 `pnpm install && pnpm build`，确认生成 `lib/`，再在 Add plugin 的 spec 文本框粘贴仓库绝对路径。
+- [ ] 首次安装若出现 `ERR_PNPM_IGNORED_BUILDS`，安装对话框列出待批准脚本，点击“允许这些脚本并重试”后安装能够继续。
 - [ ] Add plugin 后，插件条目显示名称、说明和图标，无加载错误。
 - [ ] 独立 Settings 页面和 Plugin Manager 的 Configure 页面均可打开。
 - [ ] 保存无效凭据时出现可理解错误，页面和日志没有 Secret 明文。
 - [ ] 保存有效凭据并选择 DevLead lead Session 后，状态变为已连接。
 - [ ] 飞书后台可以选择长连接并保存 `im.message.receive_v1` 订阅。
 - [ ] 用户 A 私聊后，A 的绑定出现；用户 B 私聊后，A 也能看到 B 进入 Session 的消息。
-- [ ] DevLead 的最终回复同时到达 A、B；工具调用和流式 token 不刷屏。
+- [ ] DevLead 的最终回复同时到达 A、B；工具调用和流式 token 不刷屏；取消、失败或 `max-tokens` 截断的 turn 不广播半截回复。
 - [ ] 同一消息重复投递不会重复进入 Session；网页中的人类输入也会同步。
 - [ ] 断网再恢复后 SDK 自动重连；终态错误可在设置页查看并手动重新连接。
 - [ ] 一个会话投递失败不妨碍另一个会话，恢复后下一条消息可再次送达。

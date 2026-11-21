@@ -105,13 +105,13 @@ export function userEvent(seq = 1, text = 'hello', rpcId = 'feishu-omni:om_1') {
   }
 }
 
-export function assistantEvent(seq = 2, text = 'answer', turn = 1) {
+export function assistantEvent(seq = 2, text = 'answer', turn = 1, interrupted = false) {
   return {
     seq, type: 'assistant/message', surfaceOp: 'append',
-    data: { turn, step: 1, message: { content: [{ type: 'text', text }] } },
+    data: { turn, step: 1, interrupted, message: { content: [{ type: 'text', text }] } },
   }
 }
 
-export function turnEnd(seq = 3, turn = 1) {
-  return { seq, type: 'turn/end', data: { turn, reason: { kind: 'completed' } } }
+export function turnEnd(seq = 3, turn = 1, reason: unknown = { kind: 'completed' }) {
+  return { seq, type: 'turn/end', data: { turn, reason } }
 }

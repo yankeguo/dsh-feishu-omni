@@ -1,9 +1,17 @@
-import { describe, expect, it, vi } from 'vitest'
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { OmniController } from '../src/controller.ts'
 import { dispatchManagement } from '../src/management.ts'
-import { emptyState, MemoryStateStore } from '../src/state.ts'
+import { emptyState, FileStateStore, MemoryStateStore } from '../src/state.ts'
 import type { GatewayCallbacks } from '../src/types.ts'
 import { FakeCredentials, FakeGateway, FakeSessions, SESSION } from './helpers.ts'
+
+const directories: string[] = []
+afterEach(async () => {
+  await Promise.all(directories.splice(0).map(path => rm(path, { recursive: true, force: true })))
+})
 
 function setup(initial = emptyState()) {
   const state = new MemoryStateStore(initial)
@@ -123,6 +131,37 @@ describe('OmniController', () => {
     expect(gateways).toHaveLength(1)
     expect(gateways[0]?.stops).toBe(1)
     await expect(controller.connect()).rejects.toThrow(/stopped/)
+  })
+
+  it('initializes with a corrupt state quarantined and remains configurable', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'dfo-controller-corrupt-'))
+    directories.push(directory)
+    const path = join(directory, 'state.json')
+    await writeFile(path, '{bad json')
+    const state = new FileStateStore(path)
+    const credentials = new FakeCredentials()
+    const controller = new OmniController({
+      state,
+      sessions: new FakeSessions(),
+      credentials,
+      gatewayFactory: () => new FakeGateway(),
+    })
+    await expect(controller.initialize()).resolves.toBeUndefined()
+    const status = await controller.status()
+    expect(status).toMatchObject({ appId: null, sessionId: null, phase: 'unconfigured', bindings: [] })
+    expect(status.lastError?.message).toContain('state.json.corrupt-')
+    const quarantined = (await readdir(directory)).filter(name => name.startsWith('state.json.corrupt-'))
+    expect(quarantined).toHaveLength(1)
+    expect(await readFile(join(directory, quarantined[0] ?? ''), 'utf8')).toBe('{bad json')
+
+    await controller.configure({
+      appId: 'cli_0123456789abcdef', sessionId: SESSION.sessionId, appSecret: 'secret-fixture',
+    })
+    expect(JSON.parse(await readFile(path, 'utf8'))).toMatchObject({
+      appId: 'cli_0123456789abcdef', sessionId: SESSION.sessionId,
+    })
+    expect((await controller.status()).lastError).toBeNull()
+    await controller.close()
   })
 
   it('restores auto-connect after initialization and exposes only redacted errors', async () => {

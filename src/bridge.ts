@@ -180,18 +180,28 @@ export class OmniBridge {
     }
 
     if (event.type === 'assistant/message') {
-      const data = event.data as { turn?: unknown; message?: { content?: unknown } } | undefined
+      const data = event.data as {
+        turn?: unknown
+        interrupted?: unknown
+        message?: { content?: unknown }
+      } | undefined
+      if (data?.interrupted === true) return
       if (typeof data?.turn !== 'number') return
       const rawText = textOf(data.message?.content)
       if (rawText) this.pendingAssistant.set(data.turn, rawText)
       return
     }
     if (event.type === 'turn/end') {
-      const turn = (event.data as { turn?: unknown } | undefined)?.turn
+      const data = event.data as { turn?: unknown; reason?: unknown } | undefined
+      const turn = data?.turn
       if (typeof turn !== 'number') return
       const rawText = this.pendingAssistant.get(turn)
       this.pendingAssistant.delete(turn)
-      if (rawText !== undefined) await this.broadcast(`[助手]\n${rawText}`, key)
+      const reason = typeof data?.reason === 'object' && data.reason !== null
+        ? (data.reason as { kind?: unknown }).kind
+        : data?.reason
+      // Aborted, failed, blocked and token-truncated turns are not final replies.
+      if (reason === 'completed' && rawText !== undefined) await this.broadcast(`[助手]\n${rawText}`, key)
       return
     }
 
