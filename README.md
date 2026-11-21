@@ -1,5 +1,7 @@
 # dsh-feishu-omni
 
+[![verify](https://github.com/yankeguo/dsh-feishu-omni/actions/workflows/verify.yml/badge.svg)](https://github.com/yankeguo/dsh-feishu-omni/actions/workflows/verify.yml)
+
 把一个**既有 DeepSeek Harness（DSH）Session**变成飞书里的共享指挥频道：多位飞书用户向同一个机器人发言，消息进入同一个 Session；该 Session 的人类输入和助手最终回复再广播给所有已绑定用户，但飞书用户消息不回显给发送者本人。助手最终回复使用飞书卡片渲染 Markdown（标题、列表、代码块、链接、表格），而不是把 Markdown 当纯文本显示。机器人会在消息成功进入 Session 后给原消息加一个固定的 `OK` 表情作为送达回执。
 
 图片和文件双向可用：飞书用户可以直接发图片/文件，图片以 DSH **原生 ImageBlock**、文件以**原生 FileBlock（只读绝对路径）**进入 Session，助手用现有 `Read`/`read_image`/office 工具就能看和读；助手也能在卡片里内联显示图片，或用现有 `present` 工具把文件/图片作为交付物发回飞书。**不新增任何 agent tool。**
@@ -67,7 +69,23 @@
 
 ## 安装到 DSH
 
-目标安装版：**DSH `0.2.2-rc.5`**，Node.js `>=24.9`，pnpm `12.x`。
+目标安装版：**DSH `0.2.2-rc.5`**（`engines.dsh` = `>=0.2.2-rc.5 <0.3.0`），Node.js `>=24.9`，pnpm `12.x`。
+
+### 从 npm 安装（0.1.0 approve 之后）
+
+`0.1.0` 是首个稳定版：`v0.1.0` tag 触发 CI **只 stage、不发布**，维护者在 npmjs.com 网页 approve 后版本才会公开；approve 后 `latest` 指向 `0.1.0`。
+
+```bash
+dsh plugin --profile desktop add @yankeguo/dsh-feishu-omni@0.1.0
+# 或省略版本（approve 后 latest 即 0.1.0）：
+dsh plugin --profile desktop add @yankeguo/dsh-feishu-omni
+```
+
+也可以在 Web 的 **Plugins → Add plugin** 中输入 `@yankeguo/dsh-feishu-omni`。
+
+> **首发前 npm 上不存在该包**（`npm view` 返回 404）：此时请用下面的“从源码目录安装”。新包首次发布需要维护者先做一次性 bootstrap（手工发布 `0.0.0-stage` 探针版本 → 配置 npm trusted publisher），之后 `v0.1.0` tag 才能由 CI stage。完整流程见 [docs/PUBLISHING.md](docs/PUBLISHING.md)。
+
+### 从源码目录安装（首次发布、日常开发）
 
 ```bash
 git clone https://github.com/yankeguo/dsh-feishu-omni.git
@@ -102,11 +120,22 @@ pnpm run lint
 pnpm run typecheck
 pnpm test
 pnpm build
-# 或一次执行全部检查
+# 或一次执行全部检查（lint + typecheck + test + build）
 pnpm run verify
+# 单包发布不变式（manifest/engines/files/exports/locale/icon/依赖放置/构建产物/lockfile/CI pin）
+pnpm run check:packages
+# 本地打包 + npm stage 预检（不上传、不创建 stage id；需要 npm >= 11.20.0）
+pnpm run release:dry
 ```
 
 测试全部使用 fake 飞书网关、fake Session 和临时目录，不需要真实凭据。CI 在 Node 24 上执行同一组检查。
+
+## CI 与发布
+
+- [`verify.yml`](.github/workflows/verify.yml)：push 到 main、PR（以及手动 dispatch）触发；`pnpm install --frozen-lockfile` → `pnpm run verify` → `pnpm run check:packages`。只读权限，不接触 registry。
+- [`publish.yml`](.github/workflows/publish.yml)：推送 `v*` tag（或用 workflow_dispatch 指定一个**已存在**的 tag）触发；先校验 tag 指向当前 commit、`v<version>` 与根 `package.json` 版本一致，再 install/typecheck/test/build/`check:packages`，最后用 `node scripts/stage-release.mjs` **只 stage、不发布**。稳定版 dist-tag `latest`；预发布（如 `v0.1.0-rc.1`）`next` 且绝不允许 latest。使用 GitHub OIDC trusted publishing（无长期 npm token）并生成 provenance。
+- 发布 = tag push → CI stage（此时什么都还没公开）→ 维护者在 **npmjs.com 网页**批量 approve（登录 + 2FA，一次 2FA 可批准一批）→ approve 后由维护者/被通知的 agent **手动**创建 GitHub Release：`gh release create v0.1.0 --repo yankeguo/dsh-feishu-omni --title v0.1.0 --notes-file docs/releases/v0.1.0.md --verify-tag --latest`（预发布用 `--prerelease --latest=false`）。CI 永不创建、移动或删除 tag，也不创建 Release。
+- **新包首次发布需要维护者一次性 bootstrap**：npm trusted publishing 要求包已存在，因此必须先手工发布探针版本 `0.0.0-stage` 并配置 trusted publisher，之后 `0.1.0` 才能由 CI stage。命令、rc 规则、故障排查见 [docs/PUBLISHING.md](docs/PUBLISHING.md)。
 
 ## 消息示例
 

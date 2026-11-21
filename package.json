@@ -58,7 +58,10 @@
     "lint": "eslint src tests scripts eslint.config.js vitest.config.ts",
     "test": "vitest run",
     "test:watch": "vitest",
+    "check:packages": "node scripts/check-packages.mjs",
     "verify": "pnpm run lint && pnpm run typecheck && pnpm run test && pnpm run build",
+    "release:dry": "pnpm build && node scripts/stage-release.mjs --dry-run",
+    "release:stage": "pnpm build && node scripts/stage-release.mjs",
     "prepack": "pnpm run build"
   },
   "peerDependencies": {
