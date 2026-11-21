@@ -30,6 +30,16 @@ describe('SDK-compatible HTTP instance (local adapters only)', () => {
       data: { receive_id: 'oc_fake', msg_type: 'text', content: '{"text":"hello"}', uuid: 'dshfo_fake' },
     })
     expect(result.code).toBe(0)
+    const cardResult = await client.im.v1.message.create({
+      params: { receive_id_type: 'chat_id' },
+      data: {
+        receive_id: 'oc_fake',
+        msg_type: 'interactive',
+        content: JSON.stringify({ schema: '2.0', body: { elements: [{ tag: 'markdown', content: '# hi' }] } }),
+        uuid: 'dshfo_card',
+      },
+    })
+    expect(cardResult.code).toBe(0)
     expect(urls.some(url => url.includes('/auth/v3/tenant_access_token/internal'))).toBe(true)
     expect(urls.some(url => url.includes('/im/v1/messages'))).toBe(true)
   })

@@ -1,7 +1,8 @@
 import * as Lark from '@larksuiteoapi/node-sdk'
 import axios from 'axios'
+import { buildAssistantCard } from './card.ts'
 import type { FeishuMessageEvent } from './events.ts'
-import type { FeishuGateway, GatewayCallbacks, GatewayFactory } from './types.ts'
+import type { FeishuGateway, GatewayCallbacks, GatewayFactory, SendMarkdownOptions } from './types.ts'
 
 const REQUEST_TIMEOUT_MS = 15_000
 
@@ -80,6 +81,32 @@ class OfficialFeishuGateway implements FeishuGateway {
   }
 
   async sendText(chatId: string, text: string, uuid: string, signal?: AbortSignal): Promise<void> {
+    await this.createMessage(chatId, 'text', JSON.stringify({ text }), uuid, signal)
+  }
+
+  /**
+   * Assistant replies use Card JSON 2.0 with a single `markdown` element, so
+   * headings, lists, fenced code blocks, links and tables render natively.
+   * Non-assistant traffic keeps using {@link sendText}.
+   */
+  async sendMarkdown(
+    chatId: string,
+    markdown: string,
+    uuid: string,
+    signal?: AbortSignal,
+    options?: SendMarkdownOptions,
+  ): Promise<void> {
+    const content = buildAssistantCard(markdown, options ?? {})
+    await this.createMessage(chatId, 'interactive', content, uuid, signal)
+  }
+
+  private async createMessage(
+    chatId: string,
+    messageType: 'text' | 'interactive',
+    content: string,
+    uuid: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
     // A per-call Client lets Axios cancel both token and message requests with
     // this exact signal. The shared cache retains the SDK's tenant-token reuse.
     const client = new this.sdk.Client({
@@ -94,8 +121,8 @@ class OfficialFeishuGateway implements FeishuGateway {
       params: { receive_id_type: 'chat_id' },
       data: {
         receive_id: chatId,
-        msg_type: 'text',
-        content: JSON.stringify({ text }),
+        msg_type: messageType,
+        content,
         uuid,
       },
     })

@@ -10,4 +10,4 @@ HTTP timeout and cancellation use Axios, also distributed under the MIT license.
 
 ## Reference research
 
-The implementation was designed after read-only study of <https://github.com/xmanrui/dsh-im> (MIT). No source file from that project is vendored in this package. DSH's authenticated management-route pattern and the official SDK lifecycle are reimplemented for the different shared-Session model.
+The implementation was designed after read-only study of <https://github.com/xmanrui/dsh-im> (MIT). No source file from that project is vendored in this package. DSH's authenticated management-route pattern, the official SDK lifecycle, the structure-aware Markdown chunking approach and the Feishu card fallback ladder are reimplemented for the different shared-Session model.

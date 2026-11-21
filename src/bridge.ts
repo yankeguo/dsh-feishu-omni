@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
+import { assistantCardTitle, assistantFallbackText, splitAssistantMarkdown } from './card.ts'
+import { deliveryFailureKind, isRetryable, isRetryableDelivery, silentLogger, type Logger } from './errors.ts'
 import { extractInboundMessage, type FeishuMessageEvent } from './events.ts'
-import { isRetryable, silentLogger, type Logger } from './errors.ts'
 import type { TestResult } from './public.ts'
 import { appendRecentKeys } from './state.ts'
 import { SerialQueue } from './serial.ts'
@@ -201,7 +202,7 @@ export class OmniBridge {
         ? (data.reason as { kind?: unknown }).kind
         : data?.reason
       // Aborted, failed, blocked and token-truncated turns are not final replies.
-      if (reason === 'completed' && rawText !== undefined) await this.broadcast(`[助手]\n${rawText}`, key)
+      if (reason === 'completed' && rawText !== undefined) await this.broadcastAssistant(rawText, key)
       return
     }
 
@@ -227,6 +228,79 @@ export class OmniBridge {
       else failed += 1
     }
     return { sent, failed }
+  }
+
+  /**
+   * Final assistant replies are rendered as Markdown cards. Chunking happens
+   * once per turn so every recipient receives the same deterministic split and
+   * the same per-part UUIDs.
+   */
+  private async broadcastAssistant(markdown: string, key: string): Promise<TestResult> {
+    const bindings = this.options.state.snapshot().bindings
+    const chunks = splitAssistantMarkdown(markdown)
+    let sent = 0
+    let failed = 0
+    for (const binding of bindings) {
+      const ok = await this.sendAssistantChunks(binding.chatId, chunks, key)
+      if (ok) sent += 1
+      else failed += 1
+    }
+    return { sent, failed }
+  }
+
+  private async sendAssistantChunks(chatId: string, chunks: readonly string[], key: string): Promise<boolean> {
+    const total = chunks.length
+    for (let index = 0; index < total; index += 1) {
+      if (this.stopped) return false
+      const markdown = chunks[index] ?? ''
+      const uuid = uuidFor(`${key}:${chatId}:part:${index}`)
+      const ok = await this.sendCardWithFallback(chatId, markdown, assistantCardTitle(index + 1, total), uuid)
+      // Stop instead of posting a reply with a missing middle part.
+      if (!ok) return false
+    }
+    return true
+  }
+
+  /**
+   * Deliver one Markdown card part with the plain-text fallback ladder:
+   * transient failures retry the same UUID, a rejected payload falls back to
+   * text (the server proved nothing was created), permanent recipient errors
+   * stop immediately, and an ambiguous outcome also falls back to text with
+   * the *same* UUID — Feishu allows at most one successful message per UUID in
+   * an hour, so the fallback can never duplicate a card that actually landed.
+   */
+  private async sendCardWithFallback(
+    chatId: string,
+    markdown: string,
+    title: string,
+    uuid: string,
+  ): Promise<boolean> {
+    for (let attempt = 0; attempt < this.retry.attempts; attempt += 1) {
+      if (this.stopped) return false
+      try {
+        await this.bounded(() => this.options.gateway.sendMarkdown(
+          chatId, markdown, uuid, this.lifecycle.signal, { title },
+        ))
+        return true
+      } catch (error) {
+        if (this.stopped) return false
+        const kind = deliveryFailureKind(error)
+        if (isRetryableDelivery(error) && attempt < this.retry.attempts - 1) {
+          await this.bounded(() => this.sleep(Math.min(this.retry.maxDelayMs, this.retry.baseDelayMs * 2 ** attempt)))
+          continue
+        }
+        // A permanent recipient failure (bot removed, revoked token, ...) is
+        // not repaired by re-sending the same text.
+        if (kind === 'permanent') {
+          this.onError(error)
+          this.logger.warn('Feishu assistant card delivery failed permanently')
+          return false
+        }
+        this.logger.warn('Feishu assistant card delivery failed; falling back to plain text')
+        return this.sendWithRetry(chatId, assistantFallbackText(markdown, title), uuid)
+      }
+    }
+    return false
   }
 
   private async promptWithRetry(input: PromptInput): Promise<void> {

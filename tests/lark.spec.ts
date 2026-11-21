@@ -4,7 +4,7 @@ import { createLarkGatewayFactory, type LarkSdk } from '../src/lark.ts'
 import type { GatewayCallbacks } from '../src/types.ts'
 
 function fakeSdk(responseCode = 0) {
-  const create = vi.fn(async () => ({ code: responseCode }))
+  const create = vi.fn(async (_args: unknown) => ({ code: responseCode }))
   const start = vi.fn(async () => {})
   const close = vi.fn(async () => {})
   let handler: ((event: FeishuMessageEvent) => Promise<void>) | undefined
@@ -67,5 +67,39 @@ describe('official Lark gateway', () => {
     const result = gateway.sendText('oc_chat', 'hello', 'uuid')
     await expect(result).rejects.toThrow(/230002/)
     await expect(result).rejects.toMatchObject({ code: 230002 })
+  })
+
+  it('sends assistant replies as interactive Card JSON 2.0 markdown messages', async () => {
+    const fake = fakeSdk()
+    const gateway = createLarkGatewayFactory(fake.sdk)('cli_0123456789abcdef', 'secret-fixture', callbacks)
+    const markdown = '# 标题\n\n- 一\n- 二\n\n```ts\nconst x = 1\n```\n\n[链接](https://example.test)'
+    const signal = new AbortController().signal
+    await gateway.sendMarkdown('oc_chat', markdown, 'dshfo_card', signal, { title: '[助手] (1/2)' })
+    expect(fake.create).toHaveBeenCalledWith({
+      params: { receive_id_type: 'chat_id' },
+      data: {
+        receive_id: 'oc_chat',
+        msg_type: 'interactive',
+        content: expect.any(String),
+        uuid: 'dshfo_card',
+      },
+    })
+    const call = fake.create.mock.calls[0]?.[0] as { data: { content: string } }
+    const card = JSON.parse(call.data.content) as {
+      schema: string
+      header: { title: { tag: string; content: string } }
+      body: { elements: { tag: string; content: string }[] }
+    }
+    expect(card.schema).toBe('2.0')
+    expect(card.header.title).toEqual({ tag: 'plain_text', content: '[助手] (1/2)' })
+    expect(card.body.elements).toEqual([{ tag: 'markdown', content: markdown }])
+    const options = fake.clientOptions[0] as { httpInstance: { defaults: { signal?: AbortSignal } } }
+    expect(options.httpInstance.defaults.signal).toBe(signal)
+  })
+
+  it('rejects interactive card responses with a non-zero business code', async () => {
+    const fake = fakeSdk(230099)
+    const gateway = createLarkGatewayFactory(fake.sdk)('cli_0123456789abcdef', 'secret-fixture', callbacks)
+    await expect(gateway.sendMarkdown('oc_chat', 'answer', 'uuid')).rejects.toMatchObject({ code: 230099 })
   })
 })

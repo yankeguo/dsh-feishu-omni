@@ -1,6 +1,6 @@
 import type { SessionOption } from '../src/public.ts'
 import type {
-  CredentialPort, FeishuGateway, PromptInput, SessionPort,
+  CredentialPort, FeishuGateway, PromptInput, SendMarkdownOptions, SessionPort,
 } from '../src/types.ts'
 
 export interface MutableFeishuEvent {
@@ -50,10 +50,28 @@ export function feishuEvent(overrides: {
   }
 }
 
+export interface FakeTextSend {
+  readonly chatId: string
+  readonly text: string
+  readonly uuid: string
+}
+
+export interface FakeCardSend {
+  readonly chatId: string
+  readonly markdown: string
+  readonly uuid: string
+  readonly title?: string
+}
+
 export class FakeGateway implements FeishuGateway {
-  readonly sent: { chatId: string; text: string; uuid: string }[] = []
-  readonly attempts: { chatId: string; text: string; uuid: string }[] = []
+  readonly sent: FakeTextSend[] = []
+  readonly attempts: FakeTextSend[] = []
+  readonly cards: FakeCardSend[] = []
+  readonly cardAttempts: FakeCardSend[] = []
+  /** Injected failures for `sendText`, consumed in order per chat. */
   readonly failures = new Map<string, Error[]>()
+  /** Injected failures for `sendMarkdown`, consumed in order per chat. */
+  readonly cardFailures = new Map<string, Error[]>()
   starts = 0
   stops = 0
 
@@ -65,6 +83,17 @@ export class FakeGateway implements FeishuGateway {
     const failure = this.failures.get(chatId)?.shift()
     if (failure !== undefined) throw failure
     this.sent.push({ chatId, text, uuid })
+  }
+
+  async sendMarkdown(chatId: string, markdown: string, uuid: string, _signal?: AbortSignal, options?: SendMarkdownOptions): Promise<void> {
+    const record: FakeCardSend = {
+      chatId, markdown, uuid,
+      ...(options?.title === undefined ? {} : { title: options.title }),
+    }
+    this.cardAttempts.push(record)
+    const failure = this.cardFailures.get(chatId)?.shift()
+    if (failure !== undefined) throw failure
+    this.cards.push(record)
   }
 }
 

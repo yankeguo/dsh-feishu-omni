@@ -1,3 +1,4 @@
+import type { AssistantCardOptions } from './card.ts'
 import type { FeishuMessageEvent } from './events.ts'
 import type { ConnectionPhase, SessionOption } from './public.ts'
 
@@ -43,10 +44,20 @@ export interface SessionEventLike {
   readonly data?: unknown
 }
 
+export type SendMarkdownOptions = AssistantCardOptions
+
 export interface FeishuGateway {
   start(): Promise<void>
   stop(): Promise<void>
   sendText(chatId: string, text: string, uuid: string, signal?: AbortSignal): Promise<void>
+  /** Send one Markdown chunk as a Feishu Card JSON 2.0 `markdown` element. */
+  sendMarkdown(
+    chatId: string,
+    markdown: string,
+    uuid: string,
+    signal?: AbortSignal,
+    options?: SendMarkdownOptions,
+  ): Promise<void>
 }
 
 export interface GatewayCallbacks {
