@@ -168,7 +168,7 @@ MVP 镜像：所有直接人类输入（飞书与 DSH Web）和 lead 的最终�
 
 只有完成旁置的 `StateRecoveryError` 会被吞掉：控制器初始化把它脱敏后继续，`FileStateStore.update()` 在初始化前遇到它也按“已旁置、空状态就绪”继续，但只在 Store 确实已就绪时才继续（否则原样抛出）；其它错误一律向上抛出。
 
-App Secret 仅存在于单次浏览器请求、Host 内存与 DSH credentials。控制器额外用当前 Secret 替换第三方错误消息中的出现次数；Client 保存成功立即清空输入，状态解析器没有 Secret 字段。测试包含 Secret 不出现在状态、RPC 和日志的负向用例。
+App Secret 仅存在于单次浏览器请求、Host 内存与 DSH credentials。控制器额外用当前 Secret 替换第三方错误消息中的出现次数；Client 保存成功立即清空输入，状态解析器没有 Secret 字段。测试包含 Secret 不出现在状态、RPC 和日志的负向用例。日志只记录资源 key / 文件名 / 大小 / 脱敏错误摘要，不记录字节或 Secret；本插件自身的文件系统错误只记错误码（如 `ENOENT`），不记绝对路径，但第三方库回传的错误摘要无法完全保证不含路径。
 
 ## 7. 已知限制
 
@@ -209,7 +209,7 @@ fake 测试覆盖：text/post 解析、非法事件、双键去重、prompt 失�
 
 测试边界：`tests/host-adapters.spec.ts` 的 Cordis `Context` 和 Session Controller 全部是 mock，只验证本插件构造的 list/prompt 调用形状；安装版签名兼容性来自对目标 ASAR 源码的只读核对，不等同于真实 Host 集成测试。SDK 测试也只使用本地 HTTP adapter，不验证飞书实际权限、事件投递或 WebSocket 服务行为。依赖 `chmod` 权限位的用例在 root 与 Windows 上自动跳过，POSIX `0600` mode 断言在 Windows 上不执行（Windows 上 chmod 不阻止读取或改名，`stat` 的 mode 也是合成值）。
 
-不访问真实飞书，不安装到正在运行的 DSH，不读取真实 credentials，不依赖任何测试 Secret。
+不访问真实飞书，不安装到正在运行的 DSH，不读取真实 credentials，不依赖任何测试 Secret。真实租户下的人工验收项与记录要求见 [ACCEPTANCE.md](ACCEPTANCE.md)。
 
 ## 9. 助手 Markdown 卡片（出站渲染）
 
@@ -249,7 +249,7 @@ fake 测试覆盖：text/post 解析、非法事件、双键去重、prompt 失�
   4. 单行仍超预算时按 Unicode code point 边界硬切，不会切开代理对；
   5. 单元之间用空行拼接，并逐片校验转义字节数 ≤ 预算；任何异常超限再走硬切兜底，保证不丢内容。
 - 分片结果只依赖回复文本和常量，因此同一 turn 的重试、进程重启后的同 key 发送都会得到相同的分片与 UUID；分片条数不写入持久状态。
-- 已知取舍：只按段落/围栏切分，不解析列表内部结构，超长宽松列表被拆开时可能变成多个独立列表；小于预算的表格整块保留，超过预算的大表按行切开（第二片起不重复表头，渲染上会变成多个表格片段），若单卡仍出现 >4 个表格，可能被飞书拒绝（官方只规定 4 表格上限，未给明确子码；届时同 UUID 回退文本）。
+- 已知取舍：只按段落/围栏切分，不解析列表内部结构，超长宽松列表被拆开时可能变成多个独立列表；小于预算的表格整块保留，超过预算的大表按行切开（第二片起不重复表头，渲染上会变成多个表格片段），若单卡仍出现 >4 个表格，可能被飞书拒绝（官方只规定 4 表格上限，未给明确子码；届时同 UUID 回退文本）。围栏识别沿用 CommonMark 的 0–3 空格缩进规则：4 空格缩进或引用块（`>`）内的围栏不会被当作围栏，这类内容在分片边界可能被拆开、跨卡片渲染不完美（内容不会丢失）。
 
 ### 顺序、限频与 UUID
 
@@ -348,7 +348,7 @@ const response = await client.im.v1.messageReaction.create({
 if (response.code !== 0) throw Object.assign(new Error(...), { code: response.code })
 ```
 
-与官方文档一致：`POST /open-apis/im/v1/messages/:message_id/reactions`，响应含 `data.reaction_id`；插件不保存 `reaction_id`，因为不做删除/统计（能力边界见 README 的“明确不做”）。请求复用按 appId 共享的 tenant token cache 和插件统一的 15 秒 HTTP timeout；ack 外层再套 5 秒有界等待并同时取消请求，因此最坏情况下单条消息的 ack 最多占用 FIFO 5 秒，而不受 SDK 默认重试/长超时影响。
+与官方文档一致：`POST /open-apis/im/v1/messages/:message_id/reactions`，响应含 `data.reaction_id`；插件不保存 `reaction_id`，因为不做删除/统计（能力边界见 README 的“已知限制 → 明确不做”）。请求复用按 appId 共享的 tenant token cache 和插件统一的 15 秒 HTTP timeout；ack 外层再套 5 秒有界等待并同时取消请求，因此最坏情况下单条消息的 ack 最多占用 FIFO 5 秒，而不受 SDK 默认重试/长超时影响。
 
 #### 错误分类
 

@@ -516,7 +516,7 @@ check('stage-release.mjs rejects an explicit latest dist-tag for prereleases',
 const readme = existsSync(join(ROOT, 'README.md')) ? readFileSync(join(ROOT, 'README.md'), 'utf8') : ''
 check('README.md does not reference the removed promote script',
   !/promote-release/u.test(readme),
-  'README must describe npmjs.com web approval and the manual "gh release create --verify-tag" step instead')
+  'README must describe the user-facing plugin and point the publishing process at docs/PUBLISHING.md, not at a removed promote script')
 check('README.md links to docs/PUBLISHING.md',
   /docs\/PUBLISHING\.md/u.test(readme),
   'README must point maintainers at the full publishing guide')

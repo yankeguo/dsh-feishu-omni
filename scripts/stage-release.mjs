@@ -26,7 +26,8 @@
  *     "workspace:" protocol, and every published key file inside the tarball
  *     (lib/index.js, lib/index.d.ts, lib/client.js, cordis.patch.yml,
  *     locale/en.json, locale/zh.json, icon.svg, LICENSE, README.md,
- *     THIRD_PARTY_NOTICES.md, docs/PUBLISHING.md, docs/DESIGN.md),
+ *     THIRD_PARTY_NOTICES.md, docs/PUBLISHING.md, docs/DESIGN.md,
+ *     docs/ACCEPTANCE.md, docs/DEVELOPMENT.md),
  *   - asserts no source/test/release-script files leak into the tarball,
  *   - stops at the first failure, prints the real stage id (if any) and how to
  *     repair,
@@ -90,6 +91,8 @@ const REQUIRED_TARBALL_FILES = [
   'package/THIRD_PARTY_NOTICES.md',
   'package/docs/PUBLISHING.md',
   'package/docs/DESIGN.md',
+  'package/docs/ACCEPTANCE.md',
+  'package/docs/DEVELOPMENT.md',
 ]
 /** Nothing below these prefixes may ship (sources, tests, release tooling). */
 const FORBIDDEN_TARBALL_PREFIXES = [

@@ -10,22 +10,23 @@
 `release:promote` / `release:publish` 与 `scripts/promote-release.mjs` 不存在，
 审批只能在 npmjs.com 网页由人完成。
 
-> **当前状态（2026-11-21，发布之前）**
+> **当前状态（2026-11-21 更新：`0.1.0` 已发布）**
 >
-> - npm 上**尚不存在**该包：`npm view @yankeguo/dsh-feishu-omni version` 返回
->   **E404**，没有任何已发布版本，也就没有 `latest` / `next` dist-tag；
-> - `0.1.0` 是首个稳定版，**尚未公开**；`v0.1.0` 的 annotated tag 已由维护者在本地
->   准备，**尚未 push** 到 `origin`；
-> - **从未创建过 GitHub Release**；
-> - 因此现在**不能**用 `dsh plugin ... add @yankeguo/dsh-feishu-omni` 从 npm 安装
->   （registry 上没有这个包），只能按 [README](../README.md) 的“从源码目录安装”；
-> - **第一次发布前必须先完成第 3 节的 bootstrap**：npm 已拒绝占位版本，首个版本
->   `0.1.0` 只能由维护者**人工 staged publish**（本机 `npm stage publish` + npmjs.com
->   网页 approve），再配置 trusted publisher，并在推送 `v0.1.0` tag 前临时禁用
->   `publish` workflow（避免 CI re-stage 已发布版本）；完成之后后续版本才走
->   tag → CI stage 的自动流程；
+> - `0.1.0` 是首个稳定版，**已公开**：`npm view @yankeguo/dsh-feishu-omni dist-tags`
+>   显示 `latest=0.1.0`；用户可直接
+>   `dsh plugin --profile desktop add @yankeguo/dsh-feishu-omni@0.1.0`（或省略版本安装
+>   latest）从 npm 安装；
+> - annotated tag `v0.1.0` 已 push 到 `origin`，GitHub Release `v0.1.0` 已创建；
+> - 第 3 节记录的是新包首次发布的**一次性 bootstrap**流程（维护者人工 staged publish +
+>   npmjs.com 网页 approve）；`0.1.0` 已按该流程公开，第 3 节保留作为流程记录与处置参考；
+> - 之后每个新版本按第 5 节的正常流程：bump 版本并同步 lockfile → 推送 `v*` tag →
+>   CI（`publish.yml`）stage → 维护者在 npmjs.com 网页 approve → approve 后手动创建
+>   GitHub Release；
 > - CI **不会**自动发布，也**不会**创建 GitHub Release；approve 只在 npmjs.com
->   网页人工完成（登录 + 2FA），approve 即公开且不可撤销。
+>   网页人工完成（登录 + 2FA），approve 即公开且不可撤销；
+> - 第 4 节的 trusted publisher 只允许 staged publishing；若 CI stage 报
+>   `ENEEDAUTH`/401/403，按第 8 节排查。需要未发布版本或本地修改版时，仍可按
+>   [README](../README.md) 的“从源码目录安装”构建。
 
 本文档本身随包发布：`package.json` 的 `files` 包含 `docs`，`scripts/stage-release.mjs`
 会断言 tarball 内存在 `package/docs/PUBLISHING.md`。
@@ -81,8 +82,8 @@ PR / push 到 main 由 [`verify.yml`](../.github/workflows/verify.yml) 做持续
 - **npm 账号**：对 `@yankeguo` scope 有写权限、已开启 **2FA**；包已声明
   `publishConfig.access: public`。
 - **包必须已存在于 npm registry**：npm 的 trusted publishing 只对已存在的包生效。
-  本包尚不存在，而 npm 已拒绝占位版本，所以**必须先做第 3 节的一次性 bootstrap**
-  （人工 staged publish 真实的第一个版本 `0.1.0`，并在网页 approve 让它公开）。
+  本包自 `0.1.0` 公开后已存在；新包第一次发布必须先做第 3 节的一次性 bootstrap
+  （人工 staged publish 真实版本并在网页 approve 让它公开；npm 已拒绝占位版本）。
 - **GitHub-hosted runner**（`ubuntu-latest`）：npm 不支持 self-hosted runner 的
   trusted publishing。
 - **公开仓库** `yankeguo/dsh-feishu-omni`：provenance 需要公开仓库 + 公开包。
@@ -91,7 +92,12 @@ PR / push 到 main 由 [`verify.yml`](../.github/workflows/verify.yml) 做持续
 - 解包/校验需要系统 `tar`（GNU tar 或 bsdtar；`stage-release.mjs` 用它读 tarball）。
 - **不需要任何 npm secret**：仓库 secrets 中没有、也不应该有 `NPM_TOKEN`。
 
-## 3. 新包首次发布（一次性人工 staged publish，必须先做）
+## 3. 新包首次发布（一次性人工 staged publish；`0.1.0` 已完成，保留作流程记录）
+
+> **历史记录（已完成）**：下面保留 `0.1.0` 首发当时的准备状态与操作顺序（例如“tag
+> 尚未 push”“approve 之前 npm 上不存在该包”均为当时时态）；这些步骤已在 `0.1.0`
+> 上完成。本节保留作为**下一个新包首发 / 灾难恢复**的参考，当前 registry 状态以本文
+> 顶部状态块为准。
 
 > **为什么必须手工做这一步**
 >
@@ -121,7 +127,7 @@ PR / push 到 main 由 [`verify.yml`](../.github/workflows/verify.yml) 做持续
 - 本机 `npm ≥ 11.20.0`（`npm stage publish` 自 npm 11.15.0 起提供；`npm stage
   --help` 能正常输出即具备能力），已 `npm login` 为对 `@yankeguo` scope 有写权限、
   已开启 **2FA** 的维护者账号；
-- annotated tag `v0.1.0` 已在本地准备好（**尚未 push**，最后一步 g 才推）。tag 必须
+- annotated tag `v0.1.0` 已创建（首发时先在本地准备、最后一步 g 才 push；现已 push 到 `origin`）。tag 必须
   指向包含本文件与 `0.1.0` 版本号的那个 `main` commit。
 
 ### a) 在干净 main 上做发布前全量校验
@@ -621,9 +627,9 @@ dsh plugin --profile desktop add @yankeguo/dsh-feishu-omni@0.2.0
   `check-packages.mjs` 会校验该范围不被无意改动。
 - 破坏性变更遵循 **semver**。每次发版前同步 README 与
   `docs/releases/v<version>.md`，并确认根 `package.json` 的 `version` 已 bump、
-  lockfile 已同步。`0.1.0` 是首个稳定版：**首次发布走第 3 节的人工 staged publish，
-  在网页 approve 之前 npm 上不存在 `0.1.0`**；approve 后 `latest` 才指向它，之后
-  的版本才走第 5 节的 tag → CI stage 流程。
+  lockfile 已同步。`0.1.0` 是首个稳定版，首发已按第 3 节人工 staged publish 并在网页
+  approve 公开（首发时 approve 之前 npm 上不存在 `0.1.0`，approve 后 `latest` 指向
+  它）；之后的版本走第 5 节的 tag → CI stage 流程。
 
 ## 7. 脚本参考
 
@@ -753,10 +759,10 @@ npmjs.com 网页完成，GitHub Release 在 approve 后手动用 `gh release cre
 | 现象 | 处理 |
 | --- | --- |
 | CI 报 401/403 / `no trust evidence` / trust 校验错误 | trusted publisher 配置与本次运行不匹配，或配置是旧的 `--allow-publish`（不允许 stage）。核对 repo、**工作流文件名**、environment；必要时 `npm trust list` → `npm trust revoke --id=<id>` → `scripts/trusted-publishers.sh` 重建 |
-| CI 报 `ENEEDAUTH`（stage 阶段） | 工作流缺少 `id-token: write`，或本包还没有匹配的 trusted publisher（新包首发 bootstrap 未完成）。先完成第 3 节（人工 staged publish 首发 + 配置 trust） |
+| CI 报 `ENEEDAUTH`（stage 阶段） | 工作流缺少 `id-token: write`，或本包没有匹配的 trusted publisher。`0.1.0` 已完成首发，后续版本通常是 trust 配置/工作流不匹配：按第 4 节核对 `npm trust list` 与 `publish.yml`；新包首发见第 3 节 |
 | CI 报 `npm stage` 不存在 | runner 上的 npm < 11.15；工作流已显式安装并校验 11.20.0，检查 npm 安装步骤日志 |
 | `npm stage list` / `npm trust list` 报 401/ENEEDAUTH | 本地未 `npm login`，或登录凭据不可用于该操作；approve/reject 还需要交互式 2FA |
-| `npm view` 报 **E404**（两种含义） | ① `npm view @yankeguo/dsh-feishu-omni version` 404 = **包不存在**，先做第 3 节 bootstrap（人工 staged publish 真实的第一个版本并网页 approve）；② `npm view @yankeguo/dsh-feishu-omni@<version> version` 404 = **该版本还不存在**，说明尚未 approve，或 CI 尚未 stage 成功 |
+| `npm view` 报 **E404**（两种含义） | ① `npm view @yankeguo/dsh-feishu-omni version` 404 = **包不存在**（本包自 `0.1.0` 起已存在；只有新包首发时会遇到，见第 3 节）；② `npm view @yankeguo/dsh-feishu-omni@<version> version` 404 = **该版本还不存在**，说明尚未 approve，或 CI 尚未 stage 成功 |
 | 同一版本出现多条 staged 记录 | `npm stage view <id> --json` 比较 createdAt/shasum，保留一条、`npm stage reject` 其余；每次运行只应有一条 |
 | staged 了错误 commit 的版本 | reject 该版本的全部 staged id，确认 tag/commit 后再 dispatch **同一个既有 tag**（不会移动 tag） |
 | 版本已经发布 | 不能再次 stage/publish 同版本；升版本重新发版（72 小时内可 `npm unpublish`，见下） |
@@ -771,7 +777,7 @@ npmjs.com 网页完成，GitHub Release 在 approve 后手动用 `gh release cre
 
 ## 9. 首次发布与首次 CI 运行验证清单
 
-### A. 首次发布（第 3 节人工 staged publish `0.1.0`，一次性）
+### A. 首次发布（第 3 节人工 staged publish `0.1.0`，一次性；`0.1.0` 已完成，保留作记录）
 
 - [ ] 本地 `main` 干净、根 `package.json` 版本为 `0.1.0`、lockfile 已同步、
       `docs/releases/v0.1.0.md` 存在且非空
@@ -851,9 +857,9 @@ npmjs.com 网页完成，GitHub Release 在 approve 后手动用 `gh release cre
 
 | 现象 | 原因 / 处理 |
 | --- | --- |
-| `npm view @yankeguo/dsh-feishu-omni` 一直 404 | 包尚未发布。先做第 3 节 bootstrap（人工 staged publish，网页 approve 后包才存在）；人工 staged publish 之后、approve 之前也仍是 404，属正常 |
+| `npm view @yankeguo/dsh-feishu-omni@<新版本>` 返回 404 | 该版本尚未 approve（staged 不等于已发布）；确认 CI stage 已成功并在 npmjs.com 网页 approve。`0.1.0` 之前的历史情况见第 3 节 |
 | CI stage 报 401/403 / trust 校验错误 | trust 配置不匹配或仍是旧的 `--allow-publish`；`npm trust list` → `npm trust revoke --id` → `scripts/trusted-publishers.sh` 重建 |
-| CI stage 报 `ENEEDAUTH` | `id-token: write` 缺失，或包尚未人工 staged publish 首发并 approve / 未配置 trusted publisher（bootstrap 未完成） |
+| CI stage 报 `ENEEDAUTH` | `id-token: write` 缺失，或 trusted publisher 未配置/不匹配；本包 `0.1.0` 已完成首发，按第 4 节核对 trust 记录（新包首发见第 3 节） |
 | `npm stage` 命令不存在 | npm < 11.15；升级到 11.20.0（CI 已固定） |
 | 网页 approve 报 2FA/登录失败 | 重新登录 npmjs.com 并完成 2FA；网页 approve 不逐包输入 OTP |
 | staged packages 页面看不到本版本 | CI 未运行或 stage 失败；先跑发布工作流（tag push 或 dispatch 既有 tag），stage 成功后页面才会出现该版本 |
@@ -868,27 +874,25 @@ npmjs.com 网页完成，GitHub Release 在 approve 后手动用 `gh release cre
 
 ## 12. 发布后的用户安装方式
 
-**approve 之后**（即 npm 上真正存在 `0.1.0` 之后）：
+**`0.1.0` 已公开**，以下命令可直接使用（之后每个 approve 的版本同理）：
 
 ```sh
 # cwd: 任意目录（已安装 DSH 的机器）
 # 精确版本（推荐；与 Release 对齐）
 dsh plugin --profile desktop add @yankeguo/dsh-feishu-omni@0.1.0
 
-# 省略版本（approve 后 latest 指向 0.1.0）
+# 省略版本（latest 当前指向 0.1.0）
 dsh plugin --profile desktop add @yankeguo/dsh-feishu-omni
 ```
 
 也可以在 Web：**Plugins → Add plugin**，输入 `@yankeguo/dsh-feishu-omni`。
 
-**第 3 节 bootstrap 完成（`0.1.0` 网页 approve）之前**都不能从 npm 安装：bootstrap
-之前 npm 上连这个包都不存在；人工 staged publish 之后、网页 approve 之前，`0.1.0`
-仍不存在（staged 不等于已发布），registry 上可能只有 npm 自动创建的临时占位包
-（没有 `latest`、不能安装）。之后的新版本在 approve 之前同样不存在
-（`npm view @yankeguo/dsh-feishu-omni@<version>` 返回 E404）。这些情况都只能按
-[README](../README.md) 的“从源码目录安装”：clone 仓库 → `pnpm install` →
-`pnpm build` → 在 DSH 的 **Plugins → Add plugin** 中粘贴仓库目录的**绝对路径**
-（`lib/` 被 gitignore，全新 clone 必须现构建）。
+**历史说明**：`0.1.0` 首发在网页 approve 之前，npm 上连这个包都不存在。现在 `0.1.0`
+已公开，但后续新版本在 approve 之前同样不存在（`npm view
+@yankeguo/dsh-feishu-omni@<version>` 返回 E404，staged 不等于已发布）。需要未发布
+版本或本地修改版时，按 [README](../README.md) 的“从源码目录安装”：clone 仓库 →
+`pnpm install` → `pnpm build` → 在 DSH 的 **Plugins → Add plugin** 中粘贴仓库目录的
+**绝对路径**（`lib/` 被 gitignore，全新 clone 必须现构建）。
 
 运行前提：DSH `>=0.2.2-rc.5 <0.3.0`（目标安装版 `0.2.2-rc.5`）、Node.js `>=24.9`；
 飞书企业自建应用的权限、事件订阅与长连接配置见 [README](../README.md)（`App ID` /
@@ -960,6 +964,9 @@ DSH 插件管理器/插件市场显示的是**用户友好标题与一句话描�
 - [`../scripts/check-packages.mjs`](../scripts/check-packages.mjs) —— 单包发布不变式
 - [`../scripts/trusted-publishers.sh`](../scripts/trusted-publishers.sh) —— 一次性
   trusted publisher 配置
-- [`../README.md`](../README.md) —— 安装、飞书应用配置与使用说明
+- [`../README.md`](../README.md) —— 面向使用者的功能、安装、飞书应用配置、设置页、使用与限制
+- [`DEVELOPMENT.md`](DEVELOPMENT.md) —— 仓库结构、本地开发/构建/测试与 CI
+- [`ACCEPTANCE.md`](ACCEPTANCE.md) —— 真实飞书租户下的人工验收清单
+- [`DESIGN.md`](DESIGN.md) —— 设计与内部机制、已知限制、自动测试覆盖
 - [`releases/v0.1.0.md`](releases/v0.1.0.md) —— `0.1.0` 的发布说明（手动 GitHub Release
   的正文）
