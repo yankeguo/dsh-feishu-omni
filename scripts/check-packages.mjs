@@ -533,9 +533,23 @@ const trustScript = existsSync(join(ROOT, 'scripts', 'trusted-publishers.sh')) ?
 check('trusted-publishers.sh configures --allow-stage-publish', /TRUST_ARGS=\([^)]*--allow-stage-publish/u.test(trustScript), 'CI needs stage-only trust')
 check('trusted-publishers.sh never grants --allow-publish', !/TRUST_ARGS=\([^)]*--allow-publish\b/u.test(trustScript), 'a publish-only record would let CI publish without human approval')
 const publishing = existsSync(join(ROOT, 'docs', 'PUBLISHING.md')) ? readFileSync(join(ROOT, 'docs', 'PUBLISHING.md'), 'utf8') : ''
-check('docs/PUBLISHING.md documents the first-publish bootstrap probe',
-  /0\.0\.0-stage/u.test(publishing) && /新包首次发布/u.test(publishing),
-  'the guide must keep the one-time manual bootstrap (probe publish before the trusted publisher can be configured)')
+// npm rejects placeholder versions (E403: "just manual staged publish 0.1.0, no
+// placeholding"), so the first release is a maintainer's MANUAL staged publish of
+// the real first version, approved on npmjs.com. The guide may mention the
+// rejected placeholder only as that npm rejection (inside a block that also
+// carries E403); README and the workflow comment must not describe a placeholder
+// bootstrap at all.
+const placeholderBlocks = publishing.split(/\n\s*\n/u).filter(block => block.includes('0.0.0-stage'))
+check('docs/PUBLISHING.md records the manual staged publish of the real first version (no placeholder bootstrap)',
+  /新包首次发布/u.test(publishing) &&
+  /人工 staged publish/u.test(publishing) &&
+  /npm stage publish \.\/\*\.tgz/u.test(publishing) &&
+  /E403/u.test(publishing) &&
+  !/npm publish \.\/\*\.tgz/u.test(publishing) &&
+  placeholderBlocks.every(block => block.includes('E403') && /no placeholding/u.test(block)) &&
+  !/0\.0\.0-stage/u.test(readme) &&
+  !/0\.0\.0-stage/u.test(publish),
+  'npm rejects placeholder versions (E403: "just manual staged publish 0.1.0, no placeholding"): document the one-time manual "npm stage publish" of the real 0.1.0 in docs/PUBLISHING.md, keep the rejected placeholder only as that npm rejection, and remove it from README.md and the publish.yml comment')
 check('docs/PUBLISHING.md documents npmjs.com web approval',
   /npmjs\.com/u.test(publishing) && /approve/u.test(publishing),
   'the guide must describe the human approval step on npmjs.com')

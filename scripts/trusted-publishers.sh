@@ -5,8 +5,9 @@
 #
 # Run this once after the package's FIRST publish (npm requires the package to
 # exist before a trusted publisher can be attached; this package is brand new
-# and not on the registry yet, so the maintainer must first publish the
-# `0.0.0-stage` bootstrap probe manually — see docs/PUBLISHING.md "新包首次发布").
+# and not on the registry yet, so the maintainer must first perform the MANUAL
+# staged publish of the real 0.1.0 and approve it on npmjs.com — npm rejects
+# placeholder versions; see docs/PUBLISHING.md "新包首次发布").
 # Afterward .github/workflows/publish.yml stages new versions with a short-lived
 # OIDC token and no NPM_TOKEN secret at all; a maintainer then approves the
 # staged version(s) in bulk on npmjs.com, and the GitHub Release is created
@@ -24,7 +25,8 @@
 #   - 2FA enabled on the npm account
 #   - npm login as an account with write access to the @yankeguo packages
 #     (npm trust does not accept bypass-2FA granular tokens)
-#   - the package already exists on the registry (first publish is manual)
+#   - the package already exists on the registry (the first publish is the
+#     maintainer's manual staged publish, approved on npmjs.com)
 #
 # Usage:
 #   scripts/trusted-publishers.sh                     # configure the package
@@ -155,8 +157,9 @@ else
   echo "  npm trust revoke ${PACKAGE_NAME} --id=<id>     # revoke the stale/publish-only record" >&2
   echo "  scripts/trusted-publishers.sh                  # recreate it with --allow-stage-publish" >&2
   echo "" >&2
-  echo "If the package does not exist on the registry yet, publish it once manually" >&2
-  echo "first (docs/PUBLISHING.md \"新包首次发布\"), then re-run this script." >&2
+  echo "If the package does not exist on the registry yet, stage-publish the real" >&2
+  echo "first version manually and approve it on npmjs.com (docs/PUBLISHING.md" >&2
+  echo "\"新包首次发布\"), then re-run this script." >&2
   echo "" >&2
   echo "There may be at most 10 trusted publishers per package; revoke records that" >&2
   echo "point at renamed workflows or repositories." >&2

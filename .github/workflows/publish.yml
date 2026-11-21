@@ -36,9 +36,14 @@ name: publish
 #
 # npm's requirements for trusted publishing:
 #   - the package already exists on the registry (it does NOT yet: this
-#     repository is preparing its first release, so a maintainer must publish
-#     the one-time `0.0.0-stage` bootstrap probe manually and then configure the
-#     trusted publisher before pushing v0.1.0 — see docs/PUBLISHING.md
+#     repository is preparing its first release). npm now rejects placeholder
+#     versions (E403, "no placeholding"), so the first release is the
+#     maintainer's MANUAL staged publish of the real 0.1.0 (`npm stage
+#     publish`), approved on the npmjs.com staged page. After that, configure
+#     the trusted publisher and temporarily DISABLE this workflow before pushing
+#     v0.1.0: 0.1.0 is already public, so a tag-triggered run could only fail
+#     re-staging a published version, and tags cannot be moved. Re-enable the
+#     workflow right after the manual GitHub Release — see docs/PUBLISHING.md
 #     "新包首次发布"),
 #   - this workflow file lives at .github/workflows/publish.yml,
 #   - the runner is GitHub-hosted (self-hosted runners are not supported),

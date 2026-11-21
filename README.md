@@ -73,7 +73,7 @@
 
 ### 从 npm 安装（0.1.0 approve 之后）
 
-`0.1.0` 是首个稳定版：`v0.1.0` tag 触发 CI **只 stage、不发布**，维护者在 npmjs.com 网页 approve 后版本才会公开；approve 后 `latest` 指向 `0.1.0`。
+`0.1.0` 是首个稳定版：由维护者**人工 staged publish** 真实版本后，在 npmjs.com 网页 approve 版本才会公开（见 [docs/PUBLISHING.md](docs/PUBLISHING.md) 第 3 节；npm 已拒绝占位版本）；approve 后 `latest` 指向 `0.1.0`。`0.1.0` 之后的新版本才走 tag → CI stage 流程。
 
 ```bash
 dsh plugin --profile desktop add @yankeguo/dsh-feishu-omni@0.1.0
@@ -83,7 +83,7 @@ dsh plugin --profile desktop add @yankeguo/dsh-feishu-omni
 
 也可以在 Web 的 **Plugins → Add plugin** 中输入 `@yankeguo/dsh-feishu-omni`。
 
-> **首发前 npm 上不存在该包**（`npm view` 返回 404）：此时请用下面的“从源码目录安装”。新包首次发布需要维护者先做一次性 bootstrap（手工发布 `0.0.0-stage` 探针版本 → 配置 npm trusted publisher），之后 `v0.1.0` tag 才能由 CI stage。完整流程见 [docs/PUBLISHING.md](docs/PUBLISHING.md)。
+> **首发前 npm 上不存在该包**（`npm view` 返回 404）：此时请用下面的“从源码目录安装”。新包首次发布由维护者**人工 staged publish 真实版本 `0.1.0`** 并在 npmjs.com 网页 approve（npm 已拒绝占位/探针版本），随后配置 npm trusted publisher，并在推 tag 前临时禁用 `publish` workflow（避免 CI re-stage 已发布版本）。完整流程见 [docs/PUBLISHING.md](docs/PUBLISHING.md) 第 3 节。
 
 ### 从源码目录安装（首次发布、日常开发）
 
@@ -134,8 +134,8 @@ pnpm run release:dry
 
 - [`verify.yml`](.github/workflows/verify.yml)：push 到 main、PR（以及手动 dispatch）触发；`pnpm install --frozen-lockfile` → `pnpm run verify` → `pnpm run check:packages`。只读权限，不接触 registry。
 - [`publish.yml`](.github/workflows/publish.yml)：推送 `v*` tag（或用 workflow_dispatch 指定一个**已存在**的 tag）触发；先校验 tag 指向当前 commit、`v<version>` 与根 `package.json` 版本一致，再 install/typecheck/test/build/`check:packages`，最后用 `node scripts/stage-release.mjs` **只 stage、不发布**。稳定版 dist-tag `latest`；预发布（如 `v0.1.0-rc.1`）`next` 且绝不允许 latest。使用 GitHub OIDC trusted publishing（无长期 npm token）并生成 provenance。
-- 发布 = tag push → CI stage（此时什么都还没公开）→ 维护者在 **npmjs.com 网页**批量 approve（登录 + 2FA，一次 2FA 可批准一批）→ approve 后由维护者/被通知的 agent **手动**创建 GitHub Release：`gh release create v0.1.0 --repo yankeguo/dsh-feishu-omni --title v0.1.0 --notes-file docs/releases/v0.1.0.md --verify-tag --latest`（预发布用 `--prerelease --latest=false`）。CI 永不创建、移动或删除 tag，也不创建 Release。
-- **新包首次发布需要维护者一次性 bootstrap**：npm trusted publishing 要求包已存在，因此必须先手工发布探针版本 `0.0.0-stage` 并配置 trusted publisher，之后 `0.1.0` 才能由 CI stage。命令、rc 规则、故障排查见 [docs/PUBLISHING.md](docs/PUBLISHING.md)。
+- 发布（`0.1.0` 之后的版本）= tag push → CI stage（此时什么都还没公开）→ 维护者在 **npmjs.com 网页**批量 approve（登录 + 2FA，一次 2FA 可批准一批）→ approve 后由维护者/被通知的 agent **手动**创建 GitHub Release：`gh release create v0.2.0 --repo yankeguo/dsh-feishu-omni --title v0.2.0 --notes-file docs/releases/v0.2.0.md --verify-tag --latest`（预发布用 `--prerelease --latest=false`）。CI 永不创建、移动或删除 tag，也不创建 Release。
+- **新包首次发布需要维护者人工 staged publish**：npm 已拒绝占位/探针版本，trusted publishing 又要求包已存在，因此首个版本 `0.1.0` 必须由维护者在本机 `npm stage publish` 后到 npmjs.com 网页 approve；approve 后配置 trusted publisher，并在推送 `v0.1.0` tag 前临时禁用 `publish` workflow（避免 CI re-stage 已发布版本），推 tag、创建 GitHub Release 后再恢复。命令、rc 规则、故障排查见 [docs/PUBLISHING.md](docs/PUBLISHING.md)。
 
 ## 消息示例
 
