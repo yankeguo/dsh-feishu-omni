@@ -3,15 +3,16 @@ import type { FeishuMessageEvent } from '../src/events.ts'
 import { createLarkGatewayFactory, type LarkSdk } from '../src/lark.ts'
 import type { GatewayCallbacks } from '../src/types.ts'
 
-function fakeSdk(responseCode = 0) {
+function fakeSdk(responseCode = 0, reactionCode = 0) {
   const create = vi.fn(async (_args: unknown) => ({ code: responseCode }))
+  const reactionCreate = vi.fn(async (_args: unknown) => ({ code: reactionCode }))
   const start = vi.fn(async () => {})
   const close = vi.fn(async () => {})
   let handler: ((event: FeishuMessageEvent) => Promise<void>) | undefined
   const clientOptions: unknown[] = []
   class Client {
     constructor(options: unknown) { clientOptions.push(options) }
-    readonly im = { v1: { message: { create } } }
+    readonly im = { v1: { message: { create }, messageReaction: { create: reactionCreate } } }
   }
   class DefaultCache {}
   class WSClient {
@@ -30,7 +31,7 @@ function fakeSdk(responseCode = 0) {
     Client, WSClient, EventDispatcher, DefaultCache,
     Domain: { Feishu: 'feishu' }, LoggerLevel: { error: 'error' },
   } as unknown as LarkSdk
-  return { sdk, create, start, close, clientOptions, receive: (event: FeishuMessageEvent) => handler?.(event) }
+  return { sdk, create, reactionCreate, start, close, clientOptions, receive: (event: FeishuMessageEvent) => handler?.(event) }
 }
 
 const callbacks: GatewayCallbacks = {
@@ -101,5 +102,29 @@ describe('official Lark gateway', () => {
     const fake = fakeSdk(230099)
     const gateway = createLarkGatewayFactory(fake.sdk)('cli_0123456789abcdef', 'secret-fixture', callbacks)
     await expect(gateway.sendMarkdown('oc_chat', 'answer', 'uuid')).rejects.toMatchObject({ code: 230099 })
+  })
+
+  it('adds an emoji reaction to the original message through the SDK reaction API', async () => {
+    const fake = fakeSdk()
+    const gateway = createLarkGatewayFactory(fake.sdk)('cli_0123456789abcdef', 'secret-fixture', callbacks)
+    const signal = new AbortController().signal
+    await gateway.addReaction('om_original', 'OK', signal)
+    expect(fake.reactionCreate).toHaveBeenCalledWith({
+      path: { message_id: 'om_original' },
+      data: { reaction_type: { emoji_type: 'OK' } },
+    })
+    expect(fake.create).not.toHaveBeenCalled()
+    const options = fake.clientOptions[0] as {
+      httpInstance: { defaults: { timeout: number; signal?: AbortSignal } }
+      cache: unknown
+    }
+    expect(options.httpInstance.defaults.signal).toBe(signal)
+    expect(options.cache).toBeDefined()
+  })
+
+  it('rejects non-zero reaction responses so the bridge can classify them', async () => {
+    const fake = fakeSdk(0, 99991672)
+    const gateway = createLarkGatewayFactory(fake.sdk)('cli_0123456789abcdef', 'secret-fixture', callbacks)
+    await expect(gateway.addReaction('om_original', 'OK')).rejects.toMatchObject({ code: 99991672 })
   })
 })

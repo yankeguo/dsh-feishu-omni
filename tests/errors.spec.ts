@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest'
-import { deliveryFailureKind, isRetryable, isRetryableDelivery, safeMessage } from '../src/errors.ts'
+import {
+  deliveryFailureKind, isRetryable, isRetryableDelivery, reactionFailureKind, safeMessage,
+} from '../src/errors.ts'
 
 describe('error safety and retry policy', () => {
   it('redacts known secrets and token-shaped response fields', () => {
@@ -57,5 +59,17 @@ describe('error safety and retry policy', () => {
     expect(isRetryableDelivery({ code: 230020 })).toBe(true)
     expect(isRetryableDelivery(new Error('timeout'))).toBe(true)
     expect(isRetryableDelivery({ code: 230002 })).toBe(false)
+  })
+
+  it('classifies emoji-reaction failures for throttled best-effort logging', () => {
+    expect(reactionFailureKind({ code: 99991672 })).toBe('permission')
+    expect(reactionFailureKind({ code: 99991679 })).toBe('permission')
+    expect(reactionFailureKind({ code: 'ERR_BAD_REQUEST', response: { data: { code: 99991672 } } })).toBe('permission')
+    expect(reactionFailureKind({ code: 99991400 })).toBe('rate-limit')
+    expect(reactionFailureKind({ code: 230020, response: { status: 400 } })).toBe('rate-limit')
+    expect(reactionFailureKind({ response: { status: 429 } })).toBe('rate-limit')
+    expect(reactionFailureKind({ response: { status: 500 } })).toBe('other')
+    expect(reactionFailureKind({ code: 231003 })).toBe('other')
+    expect(reactionFailureKind(new Error('message was recalled'))).toBe('other')
   })
 })

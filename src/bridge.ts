@@ -1,6 +1,9 @@
 import { createHash } from 'node:crypto'
 import { assistantCardTitle, assistantFallbackText, splitAssistantMarkdown } from './card.ts'
-import { deliveryFailureKind, isRetryable, isRetryableDelivery, silentLogger, type Logger } from './errors.ts'
+import {
+  deliveryFailureKind, isRetryable, isRetryableDelivery, reactionFailureKind, safeMessage, silentLogger,
+  type Logger, type ReactionFailureKind,
+} from './errors.ts'
 import { extractInboundMessage, type FeishuMessageEvent } from './events.ts'
 import type { TestResult } from './public.ts'
 import { appendRecentKeys } from './state.ts'
@@ -12,10 +15,41 @@ import type {
 const DEFAULT_RETRY: RetryOptions = { attempts: 3, baseDelayMs: 500, maxDelayMs: 5000 }
 const MAX_SESSION_EVENT_KEYS = 2048
 const DEFAULT_OPERATION_TIMEOUT_MS = 30_000
+const DEFAULT_ACK_TIMEOUT_MS = 5_000
+
+/**
+ * Feishu prompts carry their origin chat in the request id:
+ * `feishu-omni:<message_id>:<chat_id>`. DSH records the request id verbatim as
+ * `source.rpcId` on the committed user message, so the outbound side can decode
+ * the originating chat from the durable Session event alone — no in-memory map
+ * that a restart or delayed admission could lose.
+ */
+const REQUEST_PREFIX = 'feishu-omni:'
+
+/** Fixed emoji reaction acknowledging that a user message reached the Session. */
+export const ACK_EMOJI = 'OK'
 
 interface TextContent {
   readonly content?: unknown
   readonly source?: { readonly kind?: unknown }
+}
+
+/** `feishu` mirrors the parsed rpcId; `chatId` is absent when it cannot be decoded. */
+interface PromptOrigin {
+  readonly feishu: boolean
+  readonly chatId?: string
+}
+
+function parsePromptOrigin(rpcId: unknown): PromptOrigin {
+  if (typeof rpcId !== 'string' || !rpcId.startsWith(REQUEST_PREFIX)) return { feishu: false }
+  const rest = rpcId.slice(REQUEST_PREFIX.length)
+  // Decode from the right: message ids are opaque and only the chat id tail is
+  // consumed. A missing/empty tail (pre-upgrade request ids) keeps `feishu` and
+  // falls back to a full broadcast instead of guessing a recipient.
+  const separator = rest.lastIndexOf(':')
+  if (separator <= 0) return { feishu: true }
+  const chatId = rest.slice(separator + 1).trim()
+  return chatId ? { feishu: true, chatId } : { feishu: true }
 }
 
 function textOf(content: unknown): string {
@@ -46,6 +80,7 @@ export interface OmniBridgeOptions {
   readonly sleep?: (milliseconds: number) => Promise<void>
   readonly onError?: (error: unknown) => void
   readonly operationTimeoutMs?: number
+  readonly ackTimeoutMs?: number
 }
 
 /** One connected bot bound to one existing DSH Session and many direct chats. */
@@ -61,6 +96,9 @@ export class OmniBridge {
   private readonly pendingAssistant = new Map<number, string>()
   private readonly lifecycle = new AbortController()
   private readonly operationTimeoutMs: number
+  private readonly ackTimeoutMs: number
+  /** Last reaction failure kind (null = last attempt succeeded/never failed). */
+  private reactionFailure: ReactionFailureKind | null = null
   private stopped = false
   private stopPromise: Promise<void> | undefined
 
@@ -71,6 +109,7 @@ export class OmniBridge {
     this.sleep = options.sleep ?? (milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)))
     this.onError = options.onError ?? (() => {})
     this.operationTimeoutMs = options.operationTimeoutMs ?? DEFAULT_OPERATION_TIMEOUT_MS
+    this.ackTimeoutMs = options.ackTimeoutMs ?? DEFAULT_ACK_TIMEOUT_MS
   }
 
   async start(): Promise<void> {
@@ -142,7 +181,7 @@ export class OmniBridge {
 
     const sessionId = this.options.state.snapshot().sessionId
     if (sessionId === null) throw new Error('No DSH Session is bound')
-    const requestId = `feishu-omni:${message.messageId}`
+    const requestId = `${REQUEST_PREFIX}${message.messageId}:${message.chatId}`
     try {
       await this.promptWithRetry({
         sessionId,
@@ -164,7 +203,54 @@ export class OmniBridge {
       }
       throw error
     }
+    // Persist dedupe keys before the ack: a redelivery must never react twice,
+    // and a slow/failed reaction must never look like an unprocessed message.
     await this.options.state.update(current => appendRecentKeys(current, keys))
+    await this.acknowledge(message.messageId)
+  }
+
+  /**
+   * Best-effort `OK` reaction on the original Feishu message. It never retries,
+   * never throws, and never reaches `onError`/connection status: ack failures
+   * (missing scope, rate limit, recalled message, network) must not affect
+   * prompt admission or broadcast. The warning is logged once per failure kind
+   * state change so a missing permission cannot flood the Host log per message.
+   */
+  private async acknowledge(messageId: string): Promise<void> {
+    try {
+      // The signal also cancels the in-flight HTTP request at the same bound, so
+      // a stalled reaction cannot linger until the SDK's own 15s HTTP timeout.
+      const signal = AbortSignal.any([this.lifecycle.signal, AbortSignal.timeout(this.ackTimeoutMs)])
+      await this.bounded(
+        () => this.options.gateway.addReaction(messageId, ACK_EMOJI, signal),
+        this.ackTimeoutMs,
+      )
+      if (this.reactionFailure !== null) {
+        this.reactionFailure = null
+        this.logger.info('Feishu reaction ack recovered')
+      }
+    } catch (error) {
+      if (this.stopped) return
+      const kind = reactionFailureKind(error)
+      if (kind === this.reactionFailure) return
+      this.reactionFailure = kind
+      if (kind === 'permission') {
+        this.logger.warn(
+          'Feishu reaction ack failed: the app lacks the im:message.reactions:write_only '
+          + '(or im:message) scope; grant it in the Feishu developer console and publish a new app version '
+          + `(${safeMessage(error)})`,
+        )
+        return
+      }
+      if (kind === 'rate-limit') {
+        this.logger.warn(
+          'Feishu reaction ack failed (rate-limit; the API allows 1000 reactions/min and 50/s): '
+          + safeMessage(error),
+        )
+        return
+      }
+      this.logger.warn(`Feishu reaction ack failed (other): ${safeMessage(error)}`)
+    }
   }
 
   private async processSessionEvent(sessionId: string, event: SessionEventLike): Promise<void> {
@@ -211,18 +297,21 @@ export class OmniBridge {
     const rawText = textOf(data.content)
     if (!rawText) return
     const source = (event.data as { source?: { rpcId?: unknown } }).source
-    const text = typeof source?.rpcId === 'string' && source.rpcId.startsWith('feishu-omni:')
-      ? rawText
-      : `[DSH]\n${rawText}`
-    await this.broadcast(text, key)
+    const origin = parsePromptOrigin(source?.rpcId)
+    const text = origin.feishu ? rawText : `[DSH]\n${rawText}`
+    // The sender already has this message in their own Feishu chat; mirror it to
+    // everyone else. A prompt origin that cannot be decoded broadcasts to all
+    // (a possible one-off echo) rather than hiding the message from other users.
+    await this.broadcast(text, key, origin.chatId)
   }
 
-  private async broadcast(text: string, key: string): Promise<TestResult> {
+  private async broadcast(text: string, key: string, exceptChatId?: string): Promise<TestResult> {
     const bindings = this.options.state.snapshot().bindings
     let sent = 0
     let failed = 0
     // One queue and recipient-at-a-time writes keep ordering deterministic.
     for (const binding of bindings) {
+      if (exceptChatId !== undefined && binding.chatId === exceptChatId) continue
       const ok = await this.sendWithRetry(binding.chatId, text, uuidFor(`${key}:${binding.chatId}`))
       if (ok) sent += 1
       else failed += 1
@@ -337,11 +426,11 @@ export class OmniBridge {
   }
 
   /** Bound every external wait and reject immediately when stop aborts it. */
-  private bounded<T>(operation: () => Promise<T>): Promise<T> {
+  private bounded<T>(operation: () => Promise<T>, timeoutMs = this.operationTimeoutMs): Promise<T> {
     const signal = this.lifecycle.signal
     return new Promise<T>((resolve, reject) => {
       let settled = false
-      const timer = setTimeout(() => finish(reject, new Error('Feishu Omni operation timed out')), this.operationTimeoutMs)
+      const timer = setTimeout(() => finish(reject, new Error('Feishu Omni operation timed out')), timeoutMs)
       timer.unref()
       const finish = (callback: (value: T) => void, value: T | unknown): void => {
         if (settled) return

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { OmniBridge } from '../src/bridge.ts'
+import { ACK_EMOJI, OmniBridge } from '../src/bridge.ts'
 import {
   assistantCardTitle, buildAssistantCard, CARD_REQUEST_MAX_BYTES, estimateCardRequestBytes, splitAssistantMarkdown,
 } from '../src/card.ts'
@@ -10,33 +10,48 @@ import { assistantEvent, FakeGateway, FakeSessions, feishuEvent, SESSION, turnEn
 const alice: Binding = { openId: 'ou_alice', chatId: 'oc_alice', label: 'Alice', createdAt: '2026-01-01', updatedAt: '2026-01-01' }
 const bob: Binding = { openId: 'ou_bob', chatId: 'oc_bob', label: 'Bob', createdAt: '2026-01-01', updatedAt: '2026-01-01' }
 
-function setup(bindings: readonly Binding[] = []) {
+interface CapturedLog {
+  readonly level: 'info' | 'warn' | 'error'
+  readonly message: string
+}
+
+function setup(bindings: readonly Binding[] = [], options: { ackTimeoutMs?: number } = {}) {
   const state = new MemoryStateStore({ ...emptyState(), sessionId: SESSION.sessionId, bindings })
   const sessions = new FakeSessions()
   const gateway = new FakeGateway()
   const errors: unknown[] = []
   const sleeps: number[] = []
+  const logs: CapturedLog[] = []
+  const logger = {
+    info: (message: string) => { logs.push({ level: 'info', message }) },
+    warn: (message: string) => { logs.push({ level: 'warn', message }) },
+    error: (message: string) => { logs.push({ level: 'error', message }) },
+  }
   const bridge = new OmniBridge({
-    state, sessions, gateway,
+    state, sessions, gateway, logger,
     retry: { attempts: 3, baseDelayMs: 10, maxDelayMs: 100 },
     sleep: async milliseconds => { sleeps.push(milliseconds) },
     onError: error => errors.push(error),
+    ...(options.ackTimeoutMs === undefined ? {} : { ackTimeoutMs: options.ackTimeoutMs }),
   })
-  return { state, sessions, gateway, bridge, errors, sleeps }
+  return { state, sessions, gateway, bridge, errors, sleeps, logs }
 }
 
 describe('OmniBridge inbound', () => {
   it('binds the sender and submits one attributed prompt to the existing Session', async () => {
-    const { bridge, state, sessions } = setup()
+    const { bridge, state, sessions, gateway } = setup()
     await bridge.receive(feishuEvent({ label: '张三', text: '共享这个任务' }))
     await bridge.drain()
     expect(sessions.prompts).toEqual([{
       sessionId: SESSION.sessionId,
-      requestId: 'feishu-omni:om_1',
+      requestId: 'feishu-omni:om_1:oc_alice',
       text: '[飞书 · 张三]\n共享这个任务',
     }])
     expect(state.snapshot().bindings[0]).toMatchObject({ openId: 'ou_alice', chatId: 'oc_alice', label: '张三' })
     expect(state.snapshot().recentEventIds).toEqual(['message:om_1', 'event:event-1'])
+    // Admission succeeded: acknowledge the original message exactly once.
+    expect(gateway.reactionAttempts).toEqual([{ messageId: 'om_1', emojiType: ACK_EMOJI }])
+    expect(ACK_EMOJI).toBe('OK')
   })
 
   it('deduplicates by either message_id or event_id across concurrent delivery', async () => {
@@ -66,12 +81,15 @@ describe('OmniBridge inbound', () => {
     expect(calls).toBe(3)
     expect(sleeps).toEqual([10, 20])
     expect(gateway.sent[0]?.text).toContain('暂时无法投递')
+    // A failed admission is not acknowledged; the ack arrives with the recovery.
+    expect(gateway.reactionAttempts).toEqual([])
     await bridge.receive(feishuEvent())
     await bridge.drain()
     expect(calls).toBe(4)
-    expect(attemptedIds).toEqual(Array(4).fill('feishu-omni:om_1'))
+    expect(attemptedIds).toEqual(Array(4).fill('feishu-omni:om_1:oc_alice'))
     expect(sessions.prompts).toHaveLength(1)
     expect(state.snapshot().recentEventIds).toContain('message:om_1')
+    expect(gateway.reactionAttempts).toEqual([{ messageId: 'om_1', emojiType: ACK_EMOJI }])
   })
 
   it('serializes multi-user prompt admission in arrival order', async () => {
@@ -81,7 +99,7 @@ describe('OmniBridge inbound', () => {
     const gate = new Promise<void>(resolve => { release = resolve })
     sessions.promptHook = async input => {
       order.push(`start:${input.text}`)
-      if (input.requestId.endsWith('om_1')) await gate
+      if (input.requestId.startsWith('feishu-omni:om_1:')) await gate
       order.push(`end:${input.text}`)
       sessions.prompts.push(input)
     }
@@ -91,33 +109,34 @@ describe('OmniBridge inbound', () => {
     release?.()
     await bridge.drain()
     expect(order.map(row => row.split(':')[0])).toEqual(['start', 'end', 'start', 'end'])
-    expect(sessions.prompts.map(input => input.requestId)).toEqual(['feishu-omni:om_1', 'feishu-omni:om_2'])
+    expect(sessions.prompts.map(input => input.requestId)).toEqual(['feishu-omni:om_1:oc_a', 'feishu-omni:om_2:oc_b'])
   })
 
   it('ignores bot, group and malformed non-user traffic without injecting', async () => {
-    const { bridge, sessions } = setup()
+    const { bridge, sessions, gateway } = setup()
     await bridge.receive(feishuEvent({ senderType: 'bot' }))
     await bridge.receive(feishuEvent({ chatType: 'group' }))
     await bridge.receive(feishuEvent({ text: '' }))
     await bridge.drain()
     expect(sessions.prompts).toEqual([])
+    expect(gateway.reactionAttempts).toEqual([])
   })
 })
 
 describe('OmniBridge outbound', () => {
-  it('broadcasts human input as text and final assistant replies as markdown cards', async () => {
+  it('broadcasts human input to every binding except the sender and final replies to everyone', async () => {
     const { bridge, gateway } = setup([alice, bob])
-    await bridge.sessionEvent(SESSION.sessionId, userEvent(1, '[飞书 · Alice]\nquestion'))
+    await bridge.sessionEvent(SESSION.sessionId, userEvent(1, '[飞书 · Alice]\nquestion', 'feishu-omni:om_1:oc_alice'))
     await bridge.sessionEvent(SESSION.sessionId, assistantEvent(2, 'answer'))
     await bridge.sessionEvent(SESSION.sessionId, turnEnd(3))
     await bridge.drain()
-    expect(gateway.sent.map(row => row.chatId)).toEqual(['oc_alice', 'oc_bob'])
+    expect(gateway.sent.map(row => row.chatId)).toEqual(['oc_bob'])
     expect(gateway.sent[0]?.text).toBe('[飞书 · Alice]\nquestion')
     expect(gateway.cards.map(row => row.chatId)).toEqual(['oc_alice', 'oc_bob'])
     expect(gateway.cards.map(row => row.markdown)).toEqual(['answer', 'answer'])
     expect(gateway.cards.map(row => row.title)).toEqual(['[助手]', '[助手]'])
     const uuids = [...gateway.sent, ...gateway.cards].map(row => row.uuid)
-    expect(new Set(uuids).size).toBe(4)
+    expect(new Set(uuids).size).toBe(3)
     for (const uuid of uuids) expect(uuid.length).toBeLessThanOrEqual(50)
   })
 
@@ -229,7 +248,8 @@ describe('OmniBridge outbound', () => {
   })
 
   it('aborts a permanently stalled send so stop and the global queue finish', async () => {
-    const { bridge, gateway } = setup([alice])
+    // The sender's own chat is excluded, so the mirror goes to Bob.
+    const { bridge, gateway } = setup([alice, bob])
     let calls = 0
     gateway.sendText = () => {
       calls += 1
@@ -250,6 +270,223 @@ describe('OmniBridge outbound', () => {
     await bridge.drain()
     expect(gateway.cards).toEqual([])
     expect(gateway.sent).toEqual([])
+  })
+})
+
+describe('OmniBridge echo suppression', () => {
+  const mirrored = (rows: readonly { chatId: string; text: string }[]) => rows.map(row => ({ chatId: row.chatId, text: row.text }))
+
+  it('does not mirror a Feishu message back to its sender but mirrors it to every other binding', async () => {
+    const { bridge, gateway } = setup([alice, bob])
+    await bridge.sessionEvent(SESSION.sessionId, userEvent(1, '[飞书 · Alice]\nquestion', 'feishu-omni:om_1:oc_alice'))
+    await bridge.drain()
+    expect(mirrored(gateway.sent)).toEqual([{ chatId: 'oc_bob', text: '[飞书 · Alice]\nquestion' }])
+  })
+
+  it('applies the same rule in the other direction', async () => {
+    const { bridge, gateway } = setup([alice, bob])
+    await bridge.sessionEvent(SESSION.sessionId, userEvent(1, '[飞书 · Bob]\nreply', 'feishu-omni:om_2:oc_bob'))
+    await bridge.drain()
+    expect(mirrored(gateway.sent)).toEqual([{ chatId: 'oc_alice', text: '[飞书 · Bob]\nreply' }])
+  })
+
+  it('mirrors to multiple bindings while still excluding the sender', async () => {
+    const carol: Binding = { openId: 'ou_carol', chatId: 'oc_carol', label: 'Carol', createdAt: '2026-01-01', updatedAt: '2026-01-01' }
+    const { bridge, gateway } = setup([alice, bob, carol])
+    await bridge.sessionEvent(SESSION.sessionId, userEvent(1, '[飞书 · Bob]\nhi', 'feishu-omni:om_2:oc_bob'))
+    await bridge.drain()
+    expect(gateway.sent.map(row => row.chatId)).toEqual(['oc_alice', 'oc_carol'])
+  })
+
+  it('still broadcasts DSH web human input to every binding', async () => {
+    const { bridge, gateway } = setup([alice, bob])
+    await bridge.sessionEvent(SESSION.sessionId, userEvent(1, 'from GUI', 'web-request'))
+    // A human message without a usable rpcId (other DSH clients) is still [DSH].
+    await bridge.sessionEvent(SESSION.sessionId, {
+      seq: 2, type: 'user/message', surfaceOp: 'append',
+      data: { content: [{ type: 'text', text: 'no rpc id' }], source: { kind: 'user' } },
+    })
+    await bridge.sessionEvent(SESSION.sessionId, {
+      seq: 3, type: 'user/message', surfaceOp: 'append',
+      data: { content: [{ type: 'text', text: 'odd rpc id' }], source: { kind: 'user', rpcId: 42 } },
+    })
+    await bridge.drain()
+    expect(gateway.sent.map(row => row.chatId)).toEqual(['oc_alice', 'oc_bob', 'oc_alice', 'oc_bob', 'oc_alice', 'oc_bob'])
+    expect(gateway.sent.map(row => row.text)).toEqual([
+      '[DSH]\nfrom GUI', '[DSH]\nfrom GUI',
+      '[DSH]\nno rpc id', '[DSH]\nno rpc id',
+      '[DSH]\nodd rpc id', '[DSH]\nodd rpc id',
+    ])
+  })
+
+  it('keeps broadcasting to everyone when a legacy rpcId has no chat tail', async () => {
+    const { bridge, gateway } = setup([alice, bob])
+    // Messages submitted by a pre-upgrade plugin version carry no chat id.
+    await bridge.sessionEvent(SESSION.sessionId, userEvent(1, '[飞书 · Alice]\nlegacy', 'feishu-omni:om_1'))
+    await bridge.drain()
+    expect(gateway.sent.map(row => row.chatId)).toEqual(['oc_alice', 'oc_bob'])
+    expect(gateway.sent[0]?.text).toBe('[飞书 · Alice]\nlegacy')
+  })
+
+  it('keeps broadcasting to everyone when the rpcId tail is malformed', async () => {
+    const { bridge, gateway } = setup([alice, bob])
+    const rpcIds = ['feishu-omni:', 'feishu-omni::oc_alice', 'feishu-omni:om_1:']
+    for (const [index, rpcId] of rpcIds.entries()) {
+      await bridge.sessionEvent(SESSION.sessionId, userEvent(index + 1, '[飞书 · Alice]\nmalformed', rpcId))
+    }
+    await bridge.drain()
+    expect(gateway.sent.map(row => row.chatId)).toEqual(['oc_alice', 'oc_bob', 'oc_alice', 'oc_bob', 'oc_alice', 'oc_bob'])
+  })
+
+  it('keeps broadcasting to everyone when the decoded chat is not a current binding', async () => {
+    const { bridge, gateway } = setup([alice, bob])
+    await bridge.sessionEvent(SESSION.sessionId, userEvent(1, '[飞书 · Alice]\nstale', 'feishu-omni:om_1:oc_removed'))
+    await bridge.drain()
+    expect(gateway.sent.map(row => row.chatId)).toEqual(['oc_alice', 'oc_bob'])
+  })
+})
+
+describe('OmniBridge reaction ack', () => {
+  it('acknowledges the original message once after prompt admission', async () => {
+    const { bridge, gateway, logs } = setup()
+    await bridge.receive(feishuEvent())
+    await bridge.drain()
+    expect(gateway.reactionAttempts).toEqual([{ messageId: 'om_1', emojiType: 'OK' }])
+    expect(gateway.reactions).toEqual([{ messageId: 'om_1', emojiType: ACK_EMOJI }])
+    expect(logs.filter(log => log.level === 'warn')).toEqual([])
+  })
+
+  it('never reacts twice when Feishu redelivers the same message', async () => {
+    const { bridge, gateway, sessions } = setup()
+    await bridge.receive(feishuEvent())
+    await bridge.receive(feishuEvent())
+    await bridge.receive(feishuEvent({ eventId: 'event-2' }))
+    await bridge.drain()
+    expect(sessions.prompts).toHaveLength(1)
+    expect(gateway.reactionAttempts).toHaveLength(1)
+  })
+
+  it('does not react to ignored traffic', async () => {
+    const { bridge, gateway } = setup()
+    await bridge.receive(feishuEvent({ senderType: 'bot' }))
+    await bridge.receive(feishuEvent({ chatType: 'group' }))
+    await bridge.receive(feishuEvent({ text: '' }))
+    await bridge.drain()
+    expect(gateway.reactionAttempts).toEqual([])
+  })
+
+  it('keeps prompt admission and broadcast working when the ack lacks permission, logging once', async () => {
+    const { bridge, sessions, gateway, state, errors, logs } = setup([alice, bob])
+    const missingScope = () => Object.assign(new Error('Access denied: scope required'), { code: 99991672 })
+    gateway.reactionFailures.push(missingScope(), missingScope())
+    await bridge.receive(feishuEvent())
+    await bridge.receive(feishuEvent({ messageId: 'om_2', eventId: 'event-2' }))
+    await bridge.drain()
+    // Admission, dedupe state and broadcast are untouched by ack failures.
+    expect(sessions.prompts).toHaveLength(2)
+    expect(state.snapshot().recentEventIds).toContain('message:om_1')
+    expect(state.snapshot().recentEventIds).toContain('message:om_2')
+    expect(gateway.reactions).toEqual([])
+    // No retry: one attempt per accepted message.
+    expect(gateway.reactionAttempts).toHaveLength(2)
+    expect(errors).toEqual([])
+    const warnings = logs.filter(log => log.level === 'warn')
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]?.message).toContain('im:message.reactions:write_only')
+    await bridge.sessionEvent(SESSION.sessionId, userEvent(1, '[飞书 · Alice]\nhello', 'feishu-omni:om_1:oc_alice'))
+    await bridge.drain()
+    expect(gateway.sent.map(row => row.chatId)).toEqual(['oc_bob'])
+  })
+
+  it('logs one recovery message after the ack starts succeeding again', async () => {
+    const { bridge, gateway, logs } = setup()
+    gateway.reactionFailures.push(Object.assign(new Error('rate limited'), { code: 99991400 }))
+    await bridge.receive(feishuEvent())
+    await bridge.drain()
+    await bridge.receive(feishuEvent({ messageId: 'om_2', eventId: 'event-2' }))
+    await bridge.drain()
+    expect(gateway.reactions).toEqual([{ messageId: 'om_2', emojiType: ACK_EMOJI }])
+    expect(logs.filter(log => log.level === 'warn')).toHaveLength(1)
+    expect(logs.filter(log => log.level === 'info' && log.message.includes('recovered'))).toHaveLength(1)
+  })
+
+  it('bounds a stalled acknowledgement so later inbound work still runs', async () => {
+    const { bridge, gateway, logs } = setup([], { ackTimeoutMs: 20 })
+    let calls = 0
+    let signal: AbortSignal | undefined
+    gateway.addReaction = (_messageId: string, _emojiType: string, reactionSignal?: AbortSignal) => {
+      calls += 1
+      signal = reactionSignal
+      return new Promise<void>(() => {})
+    }
+    await bridge.receive(feishuEvent())
+    await bridge.drain()
+    expect(calls).toBe(1)
+    // The ack signal is bounded too, so the in-flight request is cancelled.
+    expect(signal?.aborted).toBe(true)
+    await bridge.receive(feishuEvent({ messageId: 'om_2', eventId: 'event-2' }))
+    await bridge.drain()
+    expect(calls).toBe(2)
+    // The same 'other' failure state is logged only once.
+    expect(logs.filter(log => log.level === 'warn')).toHaveLength(1)
+  })
+
+  it('persists the dedupe keys before acknowledging', async () => {
+    const { bridge, gateway, state } = setup()
+    let updates = 0
+    const original = state.update.bind(state)
+    state.update = async mutator => {
+      updates += 1
+      // update #1 saves the binding, update #2 persists the dedupe keys.
+      if (updates === 2) throw new Error('state write failed')
+      return original(mutator)
+    }
+    await bridge.receive(feishuEvent())
+    await bridge.drain()
+    expect(updates).toBe(2)
+    // A failed dedupe write must not acknowledge; a redelivery may retry.
+    expect(gateway.reactionAttempts).toEqual([])
+  })
+
+  it('logs a new warning when the ack failure kind changes', async () => {
+    const { bridge, gateway, logs } = setup()
+    gateway.reactionFailures.push(Object.assign(new Error('missing scope'), { code: 99991672 }))
+    gateway.reactionFailures.push(Object.assign(new Error('too many requests'), { code: 99991400 }))
+    await bridge.receive(feishuEvent())
+    await bridge.drain()
+    await bridge.receive(feishuEvent({ messageId: 'om_2', eventId: 'event-2' }))
+    await bridge.drain()
+    const warnings = logs.filter(log => log.level === 'warn')
+    expect(warnings).toHaveLength(2)
+    expect(warnings[0]?.message).toContain('im:message.reactions:write_only')
+    expect(warnings[1]?.message).toContain('rate-limit')
+    expect(warnings[1]?.message).toContain('1000 reactions/min')
+  })
+
+  it('cancels a stalled acknowledgement when the bridge stops', async () => {
+    const { bridge, gateway } = setup([], { ackTimeoutMs: 60_000 })
+    let signal: AbortSignal | undefined
+    gateway.addReaction = (_messageId: string, _emojiType: string, reactionSignal?: AbortSignal) => {
+      signal = reactionSignal
+      return new Promise<void>(() => {})
+    }
+    await bridge.receive(feishuEvent())
+    await vi.waitFor(() => expect(signal).toBeDefined())
+    expect(signal?.aborted).toBe(false)
+    await bridge.stop()
+    await bridge.drain()
+    // The bridge lifecycle aborts the ack instead of waiting for its 60s bound.
+    expect(signal?.aborted).toBe(true)
+    expect(gateway.stops).toBe(1)
+  })
+
+  it('does not react when prompt admission fails and preserves the delivery-error notice', async () => {
+    const { bridge, gateway, sessions } = setup()
+    sessions.promptHook = async () => { throw new Error('Session is unavailable') }
+    await bridge.receive(feishuEvent())
+    await bridge.drain()
+    expect(gateway.reactionAttempts).toEqual([])
+    expect(gateway.sent[0]?.text).toContain('暂时无法投递')
   })
 })
 
@@ -441,7 +678,7 @@ describe('OmniBridge assistant markdown cards', () => {
 
   it('keeps mirrored user messages and test messages on plain text', async () => {
     const { bridge, gateway } = setup([alice])
-    await bridge.sessionEvent(SESSION.sessionId, userEvent(1, 'hello'))
+    await bridge.sessionEvent(SESSION.sessionId, userEvent(1, 'hello', 'feishu-omni:om_1:oc_other'))
     await bridge.sendTest()
     await bridge.drain()
     expect(gateway.cards).toEqual([])

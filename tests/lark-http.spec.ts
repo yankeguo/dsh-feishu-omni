@@ -44,6 +44,31 @@ describe('SDK-compatible HTTP instance (local adapters only)', () => {
     expect(urls.some(url => url.includes('/im/v1/messages'))).toBe(true)
   })
 
+  it('posts an emoji reaction through the real SDK client on the documented endpoint', async () => {
+    const http = createHttpInstance()
+    const requests: { url: string; method: string; data: unknown }[] = []
+    http.defaults.adapter = async config => {
+      const url = config.url ?? ''
+      requests.push({ url, method: config.method ?? '', data: config.data })
+      if (url.includes('/auth/v3/tenant_access_token/internal')) {
+        return response(config, { code: 0, msg: 'ok', tenant_access_token: 'fake-token', expire: 7200 })
+      }
+      return response(config, { code: 0, msg: 'ok', data: { reaction_id: 'reaction-1' } })
+    }
+    const client = new Lark.Client({
+      appId: APP_ID, appSecret: 'secret-fixture', httpInstance: http, logger: quietLogger,
+    })
+    const result = await client.im.v1.messageReaction.create({
+      path: { message_id: 'om_original' },
+      data: { reaction_type: { emoji_type: 'OK' } },
+    })
+    expect(result.code).toBe(0)
+    const reactionRequest = requests.find(request => request.url.includes('/reactions'))
+    expect(reactionRequest?.url).toContain('/open-apis/im/v1/messages/om_original/reactions')
+    expect(reactionRequest?.method).toBe('post')
+    expect(JSON.parse(String(reactionRequest?.data))).toEqual({ reaction_type: { emoji_type: 'OK' } })
+  })
+
   it('unwraps the WebSocket endpoint response for the real WSClient', async () => {
     const http = createHttpInstance()
     http.defaults.adapter = async config => response(config, {

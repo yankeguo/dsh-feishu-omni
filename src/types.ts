@@ -58,6 +58,8 @@ export interface FeishuGateway {
     signal?: AbortSignal,
     options?: SendMarkdownOptions,
   ): Promise<void>
+  /** Add one emoji reaction to an existing message; a best-effort admission ack. */
+  addReaction(messageId: string, emojiType: string, signal?: AbortSignal): Promise<void>
 }
 
 export interface GatewayCallbacks {

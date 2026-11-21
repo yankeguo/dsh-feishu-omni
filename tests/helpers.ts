@@ -63,15 +63,25 @@ export interface FakeCardSend {
   readonly title?: string
 }
 
+export interface FakeReaction {
+  readonly messageId: string
+  readonly emojiType: string
+}
+
 export class FakeGateway implements FeishuGateway {
   readonly sent: FakeTextSend[] = []
   readonly attempts: FakeTextSend[] = []
   readonly cards: FakeCardSend[] = []
   readonly cardAttempts: FakeCardSend[] = []
+  readonly reactions: FakeReaction[] = []
+  readonly reactionAttempts: FakeReaction[] = []
+  readonly reactionSignals: (AbortSignal | undefined)[] = []
   /** Injected failures for `sendText`, consumed in order per chat. */
   readonly failures = new Map<string, Error[]>()
   /** Injected failures for `sendMarkdown`, consumed in order per chat. */
   readonly cardFailures = new Map<string, Error[]>()
+  /** Injected failures for `addReaction`, consumed in call order. */
+  readonly reactionFailures: Error[] = []
   starts = 0
   stops = 0
 
@@ -94,6 +104,15 @@ export class FakeGateway implements FeishuGateway {
     const failure = this.cardFailures.get(chatId)?.shift()
     if (failure !== undefined) throw failure
     this.cards.push(record)
+  }
+
+  async addReaction(messageId: string, emojiType: string, signal?: AbortSignal): Promise<void> {
+    const record: FakeReaction = { messageId, emojiType }
+    this.reactionAttempts.push(record)
+    this.reactionSignals.push(signal)
+    const failure = this.reactionFailures.shift()
+    if (failure !== undefined) throw failure
+    this.reactions.push(record)
   }
 }
 
@@ -127,7 +146,7 @@ export class FakeCredentials implements CredentialPort {
   }
 }
 
-export function userEvent(seq = 1, text = 'hello', rpcId = 'feishu-omni:om_1') {
+export function userEvent(seq = 1, text = 'hello', rpcId = 'feishu-omni:om_1:oc_alice') {
   return {
     seq, type: 'user/message', surfaceOp: 'append',
     data: { content: [{ type: 'text', text }], source: { kind: 'user', rpcId } },

@@ -100,16 +100,29 @@ class OfficialFeishuGateway implements FeishuGateway {
     await this.createMessage(chatId, 'interactive', content, uuid, signal)
   }
 
-  private async createMessage(
-    chatId: string,
-    messageType: 'text' | 'interactive',
-    content: string,
-    uuid: string,
-    signal?: AbortSignal,
-  ): Promise<void> {
-    // A per-call Client lets Axios cancel both token and message requests with
-    // this exact signal. The shared cache retains the SDK's tenant-token reuse.
-    const client = new this.sdk.Client({
+  /**
+   * Add one emoji reaction to a user message as a best-effort admission ack.
+   * The bot must be in the message's chat and the app needs
+   * `im:message.reactions:write_only` (or the wider `im:message`) scope.
+   */
+  async addReaction(messageId: string, emojiType: string, signal?: AbortSignal): Promise<void> {
+    const client = this.createClient(signal)
+    const response = await client.im.v1.messageReaction.create({
+      path: { message_id: messageId },
+      data: { reaction_type: { emoji_type: emojiType } },
+    })
+    if (response.code !== 0) {
+      throw Object.assign(
+        new Error(`Feishu message reaction create failed with code ${response.code}`),
+        { code: response.code },
+      )
+    }
+  }
+
+  private createClient(signal?: AbortSignal): Lark.Client {
+    // A per-call Client lets Axios cancel both token and request calls with this
+    // exact signal. The shared cache retains the SDK's tenant-token reuse.
+    return new this.sdk.Client({
       appId: this.appId,
       appSecret: this.appSecret,
       domain: this.sdk.Domain.Feishu,
@@ -117,6 +130,16 @@ class OfficialFeishuGateway implements FeishuGateway {
       cache: this.cache,
       httpInstance: createHttpInstance(signal),
     })
+  }
+
+  private async createMessage(
+    chatId: string,
+    messageType: 'text' | 'interactive',
+    content: string,
+    uuid: string,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const client = this.createClient(signal)
     const response = await client.im.v1.message.create({
       params: { receive_id_type: 'chat_id' },
       data: {

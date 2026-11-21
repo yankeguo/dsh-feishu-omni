@@ -142,3 +142,35 @@ export function isRetryableDelivery(error: unknown): boolean {
   if (code !== undefined && REJECTED_PAYLOAD_PROVIDER_CODES.has(code)) return false
   return isRetryable(error)
 }
+
+/**
+ * Scope-class business codes. They mean the app is missing an OpenAPI scope
+ * (here: `im:message.reactions:write_only` or the wider `im:message`), which is
+ * fixed in the Feishu developer console plus a new app version — never by
+ * retrying the same call.
+ */
+const PERMISSION_PROVIDER_CODES = new Set([
+  99991672, // Access denied: one of the required permission scopes is not granted
+  99991679, // Unauthorized: the app/tenant is not allowed to call this OpenAPI
+])
+
+/** How a failed emoji-reaction call should be reported. */
+export type ReactionFailureKind =
+  /** Missing app scope; the operator must grant it and publish a new version. */
+  | 'permission'
+  /** Frequency limit; transient by definition. */
+  | 'rate-limit'
+  /** Recalled message, network error, unknown business code, ... */
+  | 'other'
+
+/**
+ * Classify a reaction ack failure so the bridge can log once per state change
+ * and tell a missing permission apart from ordinary transient noise.
+ */
+export function reactionFailureKind(error: unknown): ReactionFailureKind {
+  const code = providerCode(error)
+  if (code !== undefined && PERMISSION_PROVIDER_CODES.has(code)) return 'permission'
+  if (code !== undefined && RETRYABLE_PROVIDER_CODES.has(code)) return 'rate-limit'
+  if (httpStatusOf(error) === 429) return 'rate-limit'
+  return 'other'
+}
