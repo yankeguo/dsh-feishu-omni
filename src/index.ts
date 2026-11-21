@@ -3,7 +3,9 @@ import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { OmniController } from './controller.ts'
-import { DshAttachmentPort, DshCredentialPort, DshFileUploadPort, DshSessionPort } from './host-adapters.ts'
+import {
+  DshAttachmentPort, DshCredentialPort, DshFileUploadPort, DshSessionPort, dshAttachmentRoot,
+} from './host-adapters.ts'
 import { createLarkGatewayFactory } from './lark.ts'
 import { registerManagementRoute } from './management.ts'
 import { FileStateStore } from './state.ts'
@@ -25,6 +27,17 @@ export function defaultStatePath(): string {
   return join(home, 'integrations', 'dsh-feishu-omni', 'state.json')
 }
 
+/**
+ * Convention fallback for the DSH attachment store root when the mounted
+ * `ctx.attachments` service does not publish one. The local backend uses
+ * `$DSH_HOME/attachments/v1`; outbound uploads may reference files inside it so
+ * an agent can present a file it received as an inbound attachment.
+ */
+export function defaultAttachmentRoot(): string {
+  const home = process.env.DSH_HOME ?? join(homedir(), '.dsh')
+  return join(home, 'attachments', 'v1')
+}
+
 /** Mount the Host half. No listener, port, DSH process or profile file is created. */
 export async function apply(ctx: Context, rawConfig: Partial<Config> = {}): Promise<void> {
   const config = Config(rawConfig)
@@ -41,6 +54,10 @@ export async function apply(ctx: Context, rawConfig: Partial<Config> = {}): Prom
     logger,
     ...(fileUploads === undefined ? {} : { fileUploads }),
     ...(attachments === undefined ? {} : { attachments }),
+    // Outbound uploads may reference the Session workspace or the DSH
+    // attachment store only. Prefer the mounted store's own root (it honors a
+    // custom dshHome) and fall back to the documented convention.
+    attachmentRoots: () => [dshAttachmentRoot(ctx) ?? defaultAttachmentRoot()],
   })
   await controller.initialize()
   ctx.effect(() => registerManagementRoute(ctx, controller), 'feishu-omni: management route')

@@ -30,14 +30,22 @@ export type SupportedImageMediaType = 'image/png' | 'image/jpeg' | 'image/webp' 
 export type AttachmentFailureReason =
   /** Exceeded this plugin's or the platform's byte bound. */
   | 'too-large'
+  /** DSH refused the image for its deployment-specific byte limit. */
+  | 'image-bytes'
+  /** DSH refused the image for its pixel-count or single-edge limit. */
+  | 'image-pixels'
   /** The resource download failed or delivered no bytes. */
   | 'download'
   /** A Feishu upload did not return a usable key. */
   | 'upload'
   /** A recognized image container outside the four formats DSH accepts. */
   | 'unsupported-image'
+  /** The image bytes are corrupt, truncated, or lie about their media type. */
+  | 'invalid-image'
   /** One Feishu message carried more attachments than this bridge accepts. */
   | 'too-many'
+  /** DSH refused the batch for its configured images-per-message limit. */
+  | 'too-many-images'
 
 /** Typed attachment failure so the bridge can pick a specific degradation notice. */
 export class AttachmentFailure extends Error {

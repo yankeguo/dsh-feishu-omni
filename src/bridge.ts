@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
-import { open, readFile, stat } from 'node:fs/promises'
-import { basename, isAbsolute, normalize, resolve } from 'node:path'
+import { open, readFile } from 'node:fs/promises'
+import { basename } from 'node:path'
 import {
   assistantCardTitle, assistantFallbackText, closesFence, openingFence, splitAssistantMarkdown,
   type FenceInfo,
@@ -8,15 +8,15 @@ import {
 import {
   AttachmentFailure, FEISHU_FILE_MAX_BYTES, FEISHU_IMAGE_MAX_BYTES, INBOUND_FILE_MAX_BYTES,
   INBOUND_IMAGE_MAX_BYTES, collectingStream, feishuFileType, formatBytes, imageMediaType,
-  mediaTypeExtension, readAllBounded, unsupportedImageFormat, type FeishuFileType,
-  type SupportedImageMediaType,
+  mediaTypeExtension, readAllBounded, unsupportedImageFormat, type SupportedImageMediaType,
 } from './attachments.ts'
 import {
-  attachmentRejectionReason, deliveryFailureKind, httpStatusOf, isRetryable, isRetryableDelivery,
-  providerFailureDetail, reactionFailureDetail, reactionFailureKind, safeMessage, silentLogger,
-  type Logger, type ReactionFailureKind,
+  attachmentErrorClass, attachmentErrorCode, attachmentRejectionReason, deliveryFailureKind, httpStatusOf,
+  isRetryable, isRetryableDelivery, providerFailureDetail, reactionFailureDetail, reactionFailureKind,
+  safeMessage, silentLogger, type AttachmentRejectionClass, type Logger, type ReactionFailureKind,
 } from './errors.ts'
 import { extractInboundMessage, type FeishuMessageEvent, type InboundAttachment, type InboundMessage } from './events.ts'
+import { localFileRoots, resolveLocalFile, type DeniedLocalFile } from './paths.ts'
 import type { TestResult } from './public.ts'
 import { appendRecentKeys } from './state.ts'
 import { SerialQueue } from './serial.ts'
@@ -162,7 +162,6 @@ interface StagedMirror {
   /** DSH-normalized image reference (images only); read back when raw bytes exceed the Feishu upload bound. */
   readonly imageRef?: unknown
   readonly fileName?: string
-  readonly fileType?: FeishuFileType
 }
 
 interface StagedInbound {
@@ -204,17 +203,84 @@ function asAttachmentFailure(
   const nested = unwrapAttachmentFailure(error)
   if (nested !== undefined) return nested
   const rejection = attachmentRejectionReason(error)
-  if (rejection === 'IMAGE_TOO_LARGE' || rejection === 'FILE_TOO_LARGE') {
-    return new AttachmentFailure('Feishu attachment exceeds the DSH admission limit', 'too-large', { cause: error })
-  }
-  if (rejection === 'UNSUPPORTED_IMAGE_TYPE') {
-    return new AttachmentFailure('Feishu image type is not accepted by DSH', 'unsupported-image', { cause: error })
+  const classified = attachmentFailureOf(rejection ?? attachmentErrorCode(error), error)
+  if (classified !== undefined) return classified
+  if (rejection === 'FILE_TOO_LARGE') {
+    return new AttachmentFailure('Feishu file exceeds the DSH admission limit', 'too-large', { cause: error })
   }
   return new AttachmentFailure(message, reason, { cause: error })
 }
 
+/**
+ * Classify one stable DSH attachment code into a specific degradation.
+ *
+ * DSH 0.2.2-rc.5 `ctx.fileUploads` wraps every `AttachmentError` into
+ * `RemoteError('session/attachment-invalid', { reason: code })` before it
+ * crosses the upload call, and prompt admission reports the same shape; both
+ * therefore reach {@link attachmentRejectionReason}. A raw `AttachmentError`
+ * is matched structurally as a fallback for other/older compositions. Neither
+ * form can be recognized by `instanceof` across package copies, and without
+ * this mapping an image rejected for pixels/dimensions would fall back to the
+ * generic "attachment service failed" notice.
+ */
+function attachmentFailureOf(code: string | undefined, error: unknown): AttachmentFailure | undefined {
+  switch (code === undefined ? undefined : attachmentErrorClass(code)) {
+    case 'image-bytes':
+      return new AttachmentFailure('Image exceeds the DSH attachment byte limit', 'image-bytes', { cause: error })
+    case 'image-pixels':
+      return new AttachmentFailure('Image exceeds the DSH attachment pixel/dimension limit', 'image-pixels', { cause: error })
+    case 'unsupported-image':
+      return new AttachmentFailure('Image type is not accepted by DSH', 'unsupported-image', { cause: error })
+    case 'invalid-image':
+      return new AttachmentFailure('Image bytes are corrupt or type-mismatched', 'invalid-image', { cause: error })
+    case 'too-many-images':
+      return new AttachmentFailure('Message carries more images than DSH accepts', 'too-many-images', { cause: error })
+    default:
+      return undefined
+  }
+}
+
+/** Sender-facing notice for one DSH image admission rejection class. */
+function imageRejectionNotice(kind: AttachmentRejectionClass): string {
+  switch (kind) {
+    case 'image-bytes':
+      return '图片超过 DSH 附件服务的字节上限，未投递到 Session，请压缩后重试。'
+    case 'image-pixels':
+      return '图片像素或尺寸超过 DSH 附件服务上限，未投递到 Session，请缩小后重试。'
+    case 'unsupported-image':
+      return '图片格式暂不支持，支持 PNG/JPEG/WEBP/GIF，请转换后重新发送。'
+    case 'invalid-image':
+      return '图片数据无效或已损坏，未投递到 Session，请重新发送。'
+    case 'too-many-images':
+      return '单条消息图片数量超过 DSH 附件服务上限，未投递到 Session。'
+  }
+}
+
+/**
+ * Sender-facing reason for one refused outbound file. Only the file name and
+ * (best-effort) size are ever forwarded; the local path never is.
+ */
+function deliverableDenialReason(reason: DeniedLocalFile['reason']): string {
+  switch (reason) {
+    case 'no-cwd':
+      return '无法解析相对路径（Session 工作目录未知）'
+    case 'no-roots':
+      return '无法确定会话工作区或 DSH 附件目录'
+    case 'outside-roots':
+      return '文件不在会话工作区或 DSH 附件目录内'
+    case 'missing':
+      return '文件不存在或不可读'
+    case 'not-file':
+      return '不是普通文件'
+    case 'empty':
+      return '文件为空'
+  }
+}
+
 /** Upper bound for the presented-file buffer of one turn; present itself caps a call at 8. */
 const MAX_PRESENTED_FILES = 32
+/** Bounded memory of ended turns, so a late `deliverables/presented` is never buffered. */
+const MAX_ENDED_TURNS = 256
 /** Never read a deliverable larger than this while preparing an outbound message. */
 const MAX_DELIVERABLE_READ_BYTES = 50 * 1024 * 1024
 /** Image reference inside assistant Markdown: `![alt](<path with spaces>)`. */
@@ -298,6 +364,75 @@ function maskInlineCode(line: string): string {
   return line.replace(INLINE_CODE, match => ' '.repeat(match.length))
 }
 
+/**
+ * Column width of the leading whitespace of one line, with CommonMark tab stops
+ * of four columns (a tab advances to the next multiple of four).
+ */
+function leadingColumns(line: string): number {
+  let column = 0
+  for (const char of line) {
+    if (char === ' ') column += 1
+    else if (char === '\t') column += 4 - (column % 4)
+    else break
+  }
+  return column
+}
+
+/** Columns contributed by a run of spaces/tabs that starts at `startColumn`. */
+function whitespaceColumns(text: string, startColumn: number): number {
+  let column = 0
+  for (const char of text) {
+    if (char === ' ') column += 1
+    else if (char === '\t') column += 4 - ((startColumn + column) % 4)
+  }
+  return column
+}
+
+/** Optional blockquote container marker (0-3 leading spaces, `>`, optional space). */
+const BLOCKQUOTE_PREFIX = /^ {0,3}> ?/
+/** List item marker plus the whitespace run that follows it. */
+const LIST_MARKER = /^ {0,3}(?:[-+*]|\d{1,9}[.)])([ \t]+)/
+
+/**
+ * True when one line starts a CommonMark indented code block: content indented
+ * by at least four columns after any blockquote/list container markers.
+ *
+ * Deliberately conservative — content indented four columns inside a nested
+ * list is treated as code too. The only cost of a false positive is that an
+ * image reference there stays Markdown text instead of becoming an inline
+ * image, never a wrong upload.
+ */
+function isIndentedCodeLine(line: string): boolean {
+  let content = line
+  // Containers can interleave (`- >     code`, `- -     code`), so consume
+  // blockquote/list markers until neither matches. Each step removes at least
+  // one marker character, so the loop always terminates.
+  for (let depth = 0; depth < 16; depth += 1) {
+    const quote = BLOCKQUOTE_PREFIX.exec(content)
+    if (quote !== null) {
+      content = content.slice(quote[0].length)
+      continue
+    }
+    const item = LIST_MARKER.exec(content)
+    if (item === null) break
+    const whitespace = item[1] ?? ''
+    const markerEnd = item[0].length - whitespace.length
+    // CommonMark consumes one to four columns after a list marker as the item's
+    // content indentation; a larger run leaves the content indented 4+ columns,
+    // which is an indented code block.
+    if (whitespaceColumns(whitespace, markerEnd) > 4) return true
+    content = content.slice(item[0].length)
+  }
+  return leadingColumns(content) >= 4
+}
+
+/** CommonMark backslash escape: an odd run of backslashes directly before `index`. */
+function isEscaped(line: string, index: number): boolean {
+  let backslashes = 0
+  for (let cursor = index - 1; cursor >= 0 && line[cursor] === '\\'; cursor -= 1) backslashes += 1
+  return backslashes % 2 === 1
+}
+
 /** Strip Markdown `<...>` destination brackets. */
 function stripAngle(target: string): string {
   const trimmed = target.trim()
@@ -345,6 +480,13 @@ export interface OmniBridgeOptions {
   readonly attachments?: AttachmentPort
   /** Latest known working directory for one Session, used to resolve relative paths. */
   readonly sessionCwd?: (sessionId: string) => string | undefined
+  /**
+   * Additional upload roots besides the Session cwd. The Host supplies the DSH
+   * attachment store (`$DSH_HOME/attachments/v1`), so an agent can present a
+   * file it received as an inbound attachment. Resolved lazily so a provider
+   * reload cannot leave a stale path.
+   */
+  readonly attachmentRoots?: () => readonly string[]
 }
 
 /** One connected bot bound to one existing DSH Session and many direct chats. */
@@ -360,6 +502,9 @@ export class OmniBridge {
   private readonly pendingAssistant = new Map<number, string>()
   /** Presented files buffered per turn until that turn ends. */
   private readonly pendingPresented = new Map<number, PresentedFile[]>()
+  /** Bounded set of turns whose `turn/end` already ran; late present events are dropped. */
+  private readonly endedTurns = new Set<number>()
+  private readonly endedTurnOrder: number[] = []
   /** Last cwd resolved by fallback `SessionPort.list`, keyed by Session. */
   private readonly cwdCache = new Map<string, string>()
   private readonly lifecycle = new AbortController()
@@ -430,6 +575,17 @@ export class OmniBridge {
       await this.options.gateway.stop()
     })()
     return this.stopPromise
+  }
+
+  /** Record one ended turn; bounded so a long-lived bridge cannot grow forever. */
+  private markTurnEnded(turn: number): void {
+    if (this.endedTurns.has(turn)) return
+    this.endedTurns.add(turn)
+    this.endedTurnOrder.push(turn)
+    if (this.endedTurnOrder.length > MAX_ENDED_TURNS) {
+      const oldest = this.endedTurnOrder.shift()
+      if (oldest !== undefined) this.endedTurns.delete(oldest)
+    }
   }
 
   private async processInbound(event: FeishuMessageEvent): Promise<void> {
@@ -674,7 +830,6 @@ export class OmniBridge {
         placeholder: mirrorPlaceholder(attachment),
         ...(bytes === undefined ? {} : { bytes }),
         fileName,
-        fileType: feishuFileType(fileName),
       },
     }
   }
@@ -739,6 +894,14 @@ export class OmniBridge {
         }
         case 'too-many':
           return `单条消息附件过多（上限 ${MAX_INBOUND_ATTACHMENTS} 个），未投递到 Session。`
+        case 'image-bytes':
+          return imageRejectionNotice('image-bytes')
+        case 'image-pixels':
+          return imageRejectionNotice('image-pixels')
+        case 'invalid-image':
+          return imageRejectionNotice('invalid-image')
+        case 'too-many-images':
+          return imageRejectionNotice('too-many-images')
         case 'upload':
           return '附件无法写入 DSH 附件服务，未投递到 Session，请稍后重试或改发文字。'
       }
@@ -747,6 +910,10 @@ export class OmniBridge {
     if (reason === 'MODEL_DOES_NOT_SUPPORT_IMAGES') {
       return '当前绑定的模型不支持图片输入，图片未投递到 Session；请改用支持视觉的模型或改发文字。'
     }
+    // Prompt admission reports the same stable image codes through
+    // `session/attachment-invalid` details; keep the notice specific there too.
+    const rejectionClass = reason === undefined ? undefined : attachmentErrorClass(reason)
+    if (rejectionClass !== undefined) return imageRejectionNotice(rejectionClass)
     if (error instanceof Error && error.message.includes('timed out')) {
       return '附件处理超时，未投递到 Session，请稍后重试。'
     }
@@ -860,8 +1027,13 @@ export class OmniBridge {
     if (mirror.bytes === undefined || mirror.fileName === undefined) return { kind: 'placeholder' }
     const bytes = mirror.bytes as Uint8Array
     const fileName = mirror.fileName as string
+    // Reuse the present-path fallback: Feishu documents that `file_name` must
+    // carry a suffix, and an inbound file named e.g. `README` has none.
+    const uploadName = uploadFileName(fileName)
+    // Derive the upload type from the final name: a dotfile like `.env` becomes
+    // `.env.bin` and must not keep a misleading document type.
     const key = await this.uploadMirrorWithRetry(
-      () => this.options.gateway.uploadFile(bytes, fileName, mirror.fileType ?? 'stream', this.attachmentSignal()),
+      () => this.options.gateway.uploadFile(bytes, uploadName, feishuFileType(uploadName), this.attachmentSignal()),
     )
     return key === undefined ? { kind: 'placeholder' } : { kind: 'file', key }
   }
@@ -935,6 +1107,12 @@ export class OmniBridge {
         this.logger.warn('Ignoring malformed deliverables/presented session event')
         return
       }
+      // A present event that arrives after its turn ended (replay, reordering)
+      // can never be delivered; buffering it would leak one map entry per turn.
+      if (this.endedTurns.has(batch.turn)) {
+        this.logger.warn('Ignoring a deliverables/presented event that arrived after its turn ended')
+        return
+      }
       const merged = this.pendingPresented.get(batch.turn) ?? []
       let truncated = false
       for (const file of batch.files) {
@@ -968,6 +1146,7 @@ export class OmniBridge {
       const data = event.data as { turn?: unknown; reason?: unknown } | undefined
       const turn = data?.turn
       if (typeof turn !== 'number') return
+      this.markTurnEnded(turn)
       const rawText = this.pendingAssistant.get(turn)
       this.pendingAssistant.delete(turn)
       const presented = this.pendingPresented.get(turn)
@@ -1146,20 +1325,26 @@ export class OmniBridge {
     }
   }
 
-  /** Resolve one absolute or cwd-relative local path. */
-  private resolveLocalPath(rawPath: string, cwd: string | undefined): string | undefined {
-    const trimmed = rawPath.trim()
-    if (!trimmed) return undefined
-    if (isAbsolute(trimmed)) return normalize(trimmed)
-    if (cwd === undefined) return undefined
-    return resolve(cwd, trimmed)
+  /**
+   * Real allowed upload roots for one operation: the Session workspace plus the
+   * DSH attachment store (so an agent can present/embed a file it received as an
+   * inbound attachment). No root is guessed here; the Host supplies the store.
+   */
+  private async fileRoots(cwd: string | undefined): Promise<readonly string[]> {
+    let extra: readonly string[] = []
+    try {
+      extra = this.options.attachmentRoots?.() ?? []
+    } catch {
+      // A Host adapter failure must degrade to "not allowed", never to "allow".
+      this.logger.warn('Feishu attachment root lookup failed; only the Session workspace is allowed')
+    }
+    return localFileRoots(cwd, extra)
   }
 
-  /** Upload one local image for inline display inside the assistant card. */
-  private async inlineImageKey(path: string): Promise<string | undefined> {
+  /** Upload one contained local image for inline display inside the assistant card. */
+  private async inlineImageKey(path: string, size: number): Promise<string | undefined> {
     try {
-      const info = await stat(path)
-      if (!info.isFile() || info.size === 0 || info.size > MAX_DELIVERABLE_READ_BYTES) return undefined
+      if (size > MAX_DELIVERABLE_READ_BYTES) return undefined
       const head = await readFileHead(path, 64)
       const mediaType = imageMediaType(head)
       if (mediaType === undefined) return undefined
@@ -1211,10 +1396,15 @@ export class OmniBridge {
 
   /**
    * Rewrite local Markdown image references in one final assistant reply into
-   * Feishu `image_key`s that the card's markdown element renders inline. Paths
-   * already delivered by `present` are left alone (that path sends a real image
-   * message), as are URLs, `image_key`s, missing files, non-images, code fences
-   * and every upload failure: the original Markdown stays untouched then.
+   * Feishu `image_key`s that the card's markdown element renders inline.
+   *
+   * A reference is only touched when it points at a real image inside an
+   * allowed root (Session workspace or DSH attachment store). Paths already
+   * delivered by `present` keep their original text (that path sends a real
+   * image message), as do URLs, `image_key`s, fenced/indented code examples,
+   * inline code spans, escaped `\![x](path)`, missing files, files outside the
+   * allowed roots, non-images and every upload failure. The original Markdown
+   * then stays untouched, so it can only render as text, never as local bytes.
    */
   private async rewriteInlineImages(
     markdown: string,
@@ -1237,6 +1427,11 @@ export class OmniBridge {
         fence = opened
         continue
       }
+      // CommonMark indented code block (4 columns after blockquote/list
+      // containers). Conservative on purpose: a 4-column-indented line inside
+      // a nested list is skipped too, which at worst leaves such an image as
+      // Markdown text.
+      if (isIndentedCodeLine(line)) continue
       // Mask inline code spans so `` `![alt](path)` `` examples are not rewritten;
       // masking keeps offsets aligned with the original line.
       const masked = maskInlineCode(line)
@@ -1244,33 +1439,41 @@ export class OmniBridge {
       for (;;) {
         const match = MARKDOWN_IMAGE_REF.exec(masked)
         if (match === null) break
+        // `\![alt](path)` is escaped literal text, not an image reference.
+        if (isEscaped(masked, match.index)) continue
         candidates.push({ line: index, match })
       }
     }
     if (candidates.length === 0) return markdown
+    // Drop URL/image_key references before touching the filesystem: they can
+    // never be local files and must not trigger a Session-list cwd fallback.
+    const localCandidates = candidates.filter(candidate => {
+      const target = stripAngle(candidate.match[2] ?? '')
+      return !IMAGE_KEY_TARGET.test(target) && !NON_PATH_TARGET.test(target)
+    })
+    if (localCandidates.length === 0) return markdown
 
-    const needsCwd = candidates.some(candidate => !isAbsolute(stripAngle(candidate.match[2] ?? '')))
-      || (presented ?? []).some(file => !isAbsolute(file.path))
-    const cwd = needsCwd ? await this.sessionWorkingDirectory(sessionId) : undefined
+    const cwd = await this.sessionWorkingDirectory(sessionId)
+    const roots = await this.fileRoots(cwd)
 
+    // `present` already delivered its own paths as real image messages; compare
+    // real paths so a symlinked present entry still suppresses the duplicate.
     const excluded = new Set<string>()
     for (const file of presented ?? []) {
-      const resolved = this.resolveLocalPath(file.path, cwd)
-      if (resolved !== undefined) excluded.add(resolved)
+      const resolution = await resolveLocalFile({ rawPath: file.path, cwd, roots })
+      if (resolution.kind === 'ok') excluded.add(resolution.path)
     }
 
     const keys = new Map<string, string | undefined>()
     const replacements: { readonly line: number; readonly match: RegExpExecArray; key: string }[] = []
-    for (const candidate of candidates) {
+    for (const candidate of localCandidates) {
       const rawTarget = stripAngle(candidate.match[2] ?? '')
-      if (IMAGE_KEY_TARGET.test(rawTarget)) continue
-      const path = isAbsolute(rawTarget)
-        ? normalize(rawTarget)
-        : (NON_PATH_TARGET.test(rawTarget) ? undefined : this.resolveLocalPath(rawTarget, cwd))
-      if (path === undefined || excluded.has(path)) continue
+      const resolution = await resolveLocalFile({ rawPath: rawTarget, cwd, roots })
+      if (resolution.kind !== 'ok' || excluded.has(resolution.path)) continue
+      const path = resolution.path
       let key = keys.get(path)
       if (key === undefined && !keys.has(path)) {
-        key = await this.inlineImageKey(path)
+        key = await this.inlineImageKey(path, resolution.size)
         keys.set(path, key)
       }
       if (key === undefined) continue
@@ -1311,14 +1514,14 @@ export class OmniBridge {
     const bindings = this.options.state.snapshot().bindings
     if (bindings.length === 0) return
     let cwd: string | undefined
-    let cwdResolved = false
+    let roots: readonly string[] | undefined
     for (const [index, file] of files.entries()) {
       if (this.stopped) return
-      if (!cwdResolved) {
-        cwdResolved = true
+      if (roots === undefined) {
         cwd = await this.sessionWorkingDirectory(sessionId)
+        roots = await this.fileRoots(cwd)
       }
-      const prepared = await this.prepareDeliverable(file, cwd)
+      const prepared = await this.prepareDeliverable(file, cwd, roots)
       for (const binding of bindings) {
         if (this.stopped) return
         const uuid = uuidFor(`${key}:${binding.chatId}:deliverable:${index}`)
@@ -1327,20 +1530,24 @@ export class OmniBridge {
     }
   }
 
-  /** Classify, bound and upload one presented file once for all recipients. */
-  private async prepareDeliverable(file: PresentedFile, cwd: string | undefined): Promise<PreparedDeliverable> {
+  /** Classify, contain, bound and upload one presented file once for all recipients. */
+  private async prepareDeliverable(
+    file: PresentedFile,
+    cwd: string | undefined,
+    roots: readonly string[],
+  ): Promise<PreparedDeliverable> {
     const name = deliverableName(file.path)
-    const path = isAbsolute(file.path) ? normalize(file.path) : this.resolveLocalPath(file.path, cwd)
-    if (path === undefined) return { kind: 'degraded', name, reason: '无法解析相对路径（Session 工作目录未知）' }
-    let info
-    try {
-      info = await stat(path)
-    } catch {
-      return { kind: 'degraded', name, reason: '文件不存在或不可读' }
+    const resolution = await resolveLocalFile({ rawPath: file.path, cwd, roots })
+    if (resolution.kind === 'denied') {
+      return {
+        kind: 'degraded',
+        name,
+        ...(resolution.size === undefined ? {} : { size: resolution.size }),
+        reason: deliverableDenialReason(resolution.reason),
+      }
     }
-    if (!info.isFile()) return { kind: 'degraded', name, reason: '不是普通文件' }
-    const size = info.size
-    if (size === 0) return { kind: 'degraded', name, size, reason: '文件为空' }
+    const path = resolution.path
+    const size = resolution.size
     if (size > MAX_DELIVERABLE_READ_BYTES) {
       return { kind: 'degraded', name, size, reason: `附件超过处理上限（图片单文件需 ≤${formatBytes(MAX_DELIVERABLE_READ_BYTES)}，其他文件需 ≤${formatBytes(FEISHU_FILE_MAX_BYTES)}）` }
     }

@@ -29,7 +29,7 @@
   - **发送**：`msg_type=image` 的 content 为 `{"image_key":"…"}`，`msg_type=file` 为 `{"file_key":"…"}`；仍走 `POST /open-apis/im/v1/messages`（`receive_id_type=chat_id`），`uuid` 是 body 字段、≤50 字符，相同 uuid 1 小时内至多一条成功消息，与 `msg_type` 无关。**上传的 `file_type` 与发送的 `msg_type` 必须匹配**：`opus→audio`、`mp4→media`、`pdf/doc/xls/ppt/stream→file`，否则 `230055`。来源：[发送消息](https://open.feishu.cn/document/server-docs/im-v1/message/create)。
   - **入站事件 content**：`image`=`{image_key}`；`file`=`{file_key,file_name}`；`audio`=`{file_key,duration}`；`media`=`{file_key,image_key,file_name,duration}`（音频/视频资源都用 `type=file` 下载）；`post` 富文本的 `img` 节点=`{tag:'img',image_key}`。来源：[接收消息内容结构](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/im-v1/message/events/message_content)。
   - 相关错误码：`234006` 文件/图片超大小限制、`234010` 空文件、`234011` 无法识别图片格式、`234037` 下载超 100 MB、`230055` file_type 与 msg_type 不匹配、`230017` 非同 app 上传的资源、`230002` 机器人不在会话。
-  - **DSH 0.2.2-rc.5 附件事实**（安装版 ASAR 与 `/tmp/dsh-rc5` 源码一致）：`SessionPromptRequest.content` 支持 `{type:'text'}`、`{type:'image',mediaType,data}`、`{type:'file',receiptId}`；`{type:'file',receiptId}` 经 `fileUploads.resolve` 解析，图片 receipt → ImageBlock、文件 receipt → FileBlock；`ctx.fileUploads.uploadImageStream/uploadStream` 返回 staged receipt；`ctx.attachments` 的 `imageLimits` 默认 50 MiB/图、20 图/消息、200 MiB/消息、媒体类型仅 PNG/JPEG/WEBP/GIF；附件存于 `~/.dsh/attachments/v1`，内容寻址、**永不自动清理**；FileBlock 在请求装配时被投影成含只读绝对路径的文本句柄。
+  - **DSH 0.2.2-rc.5 附件事实**（安装版 ASAR 与 `/tmp/dsh-rc5` 源码一致）：`SessionPromptRequest.content` 支持 `{type:'text'}`、`{type:'image',mediaType,data}`、`{type:'file',receiptId}`；`{type:'file',receiptId}` 经 `fileUploads.resolve` 解析，图片 receipt → ImageBlock、文件 receipt → FileBlock；`ctx.fileUploads.uploadImageStream/uploadStream` 返回 staged receipt；`ctx.attachments` 的 `imageLimits` 默认 50 MiB/图、20 图/消息、200 MiB/消息、媒体类型仅 PNG/JPEG/WEBP/GIF；附件存于 `~/.dsh/attachments/v1`，内容寻址、**永不自动清理**；FileBlock 在请求装配时被投影成含只读绝对路径的文本句柄。`ctx.attachments` 抛出的 `AttachmentError`（`name='AttachmentError'` + 稳定 `code`；rc.5 代码表含 `IMAGE_TOO_LARGE`/`IMAGES_TOO_LARGE`/`IMAGE_TOO_MANY_PIXELS`/`IMAGE_DIMENSION_TOO_LARGE`/`UNSUPPORTED_IMAGE_TYPE`/`INVALID_IMAGE*`/`TOO_MANY_IMAGES` 等）会在 `ctx.fileUploads` 的 `store()` 里被包装成 `RemoteError('session/attachment-invalid', { reason: code })` 再抛出；`IMAGE_TOO_LARGE`/`UNSUPPORTED_IMAGE_TYPE` 在 `uploadImageStream` 内直接以同一 RemoteError 形式抛出。插件主路径按 RemoteError 的 `details.reason` 分类，同时保留按 code 结构识别裸 `AttachmentError` 的兜底（跨重复安装副本时 DSH 自身用 `isAttachmentError` 按 code 识别，不使用 `instanceof`）。本地附件后端在实例上暴露 `root`（`$DSH_HOME/attachments/v1`），插件优先用它作为出站路径白名单根，缺失时按同一约定路径。
   - **DSH `ctx.get` 语义**（cordis 4.1.0 运行时验证）：`ctx.get('fileUploads')`/`ctx.get('attachments')` 不需要 `inject`，返回服务或 `undefined`，不会抛错；未 `inject` 的 `ctx.attachments` 裸属性访问会抛 `cannot get property without inject`。因此插件保持 `inject` 不变、用 `ctx.get` 可选适配，缺失时降级。
   - **DSH `deliverables/presented`**：`present` 工具在 `tools/result` 成功后 append 该**只读事件**（`{turn, callId, files:[{path, description?}]}`），它不是 surface 事件（无 `surfaceOp`），但 `{global:true}` 的 `session/event` 观察者能收到；`present` 已把路径解析为绝对路径。
   - **DSH Session 工作目录**：`session/event` 监听器第一个参数是 Session 对象，`session.header.cwd` 是创建目录；`working-directory/change` 事件携带 `cd` 后的 effective cwd；据此解析相对 Markdown 图片路径与相对 present 路径。
@@ -191,19 +191,21 @@ App Secret 仅存在于单次浏览器请求、Host 内存与 DSH credentials。
 17. **>100 MB 资源不支持**：飞书 `type=file` 下载 ≥100 MB 需要 Range 分片（≤32 MB/片），`type=image` 完全不支持 Range；插件使用一次性流式下载，因此入站文件上限 100 MB、图片上限 20 MB。
 18. **群聊仍不支持**：图片/文件只接受 p2p 用户消息；群聊 @机器人、合并转发/卡片消息里的资源（飞书返回 234043）不处理。
 19. **出站文件/图片平台限制**：文件 ≤30 MB 且无分片/断点上传；图片 ≤10 MB，GIF ≤2000×2000、其他 ≤12000×12000。超过 10 MB 的图片先用 DSH `attachments.saveImage` 规范化（最长边/像素受限），规范化后仍超限则文本降级；GIF 的尺寸限制 DSH 规范化不保证满足（2048 像素预算高于飞书 GIF 的 2000 限制），超大 GIF 可能只能降级。音频/视频统一按 `file_type=stream` 以 `msg_type=file` 发送（飞书要求 file_type 与 msg_type 匹配），不做内联播放。
-20. **入站镜像二次上传是 best effort**：其他绑定用户看到的图片/文件依赖同一 app 重新上传；缺 `im:resource:upload`、资源超过 10 MB（图片，且无规范化副本）、文件超过 30 MB 或上传失败时只发占位文本，且不重试。
-21. **卡片内联图片改写范围有限**：只处理**行内** Markdown 图片语法（`![alt](<path>)` / `![alt](path)`），跳过 fenced code block 与行内代码 span（`` `...` ``）；引用块/列表内的行内图片仍会处理，HTML `<img>`、跨行图片语法、链接引用式图片（`![alt][ref]`）不改写。改写失败保留原 Markdown，飞书客户端会把它当普通图片链接显示（可能显示为破图/路径文本）。
+20. **入站镜像二次上传是 best effort**：其他绑定用户看到的图片/文件依赖同一 app 重新上传；缺 `im:resource:upload`、资源超过 10 MB（图片，且无规范化副本）、文件超过 30 MB 或可重试错误重试耗尽时才发占位文本（可重试码仍先按 11.4 指数退避重试）。
+21. **卡片内联图片改写范围有限**：只处理**行内** Markdown 图片语法（`![alt](<path>)` / `![alt](path)`），跳过 fenced code block、4 列缩进的代码块（tab 按 4 列 tab stop 展开；引用块/列表容器内也识别；保守实现：4 列缩进的嵌套列表内容也一并跳过）、行内代码 span（`` `...` ``）与反斜杠转义的 `\![alt](path)`；引用块内的行内图片仍会处理，HTML `<img>`、跨行图片语法、链接引用式图片（`![alt][ref]`）不改写。改写失败（含根外路径、上传失败）保留原 Markdown；present 去重时也保留原文，卡片只显示文本、不含字节，飞书客户端可能显示为破图/路径文本。
 22. **相对路径依赖 Session cwd**：使用 `session.header.cwd` 与 `working-directory/change` 的 effective cwd；插件重连后若从未见过该 Session 的事件，会退回 `sessionController.list` 的 cwd（可能滞后于真实 `cd`）。无法解析时保留原 Markdown。
 23. **大附件阻塞共享 FIFO**：附件下载/暂存/上传发生在单一 FIFO 内，单个大附件的 120 秒上限会推迟其他用户的消息与助手回复；MVP 接受这一顺序性代价，未做后台附件队列。
 24. **`present` 是否可用取决于 Session 的 agent preset**：标准/默认 preset 挂载了 `present`（本插件依赖它产生 `deliverables/presented`）；若绑定 Session 使用未挂载 present 的 minimal preset，出站交付物链路不可用，但助手 Markdown 内联图片仍可用。
 25. **未绑定 staged receipt 不会主动释放**：一条多附件消息在暂存到一半失败、或 prompt 被 DSH 拒绝（如模型无视觉）时，已 mint 的 receipt 没有公开释放 API；对应的内容寻址字节会留在 `~/.dsh/attachments/v1` 直到进程/附件服务生命周期结束。次数受消息量约束，且相同内容按 sha256 去重，不会无限膨胀；DSH rc.5 没有提供 receipt 回收接口，插件不绕过这一边界。
 26. **cwd 缓存不主动裁剪**：Controller 的 `sessionCwds` 会记录连接期间观察到 cwd 的每个 Session（子 Agent 也在内），只在断开连接时整体清空；长期运行且大量 Session 时是一个很小的内存占用，未做 LRU。
 27. **真实平台未验证**：HEIC/BMP/TIFF 拒绝提示、`im:message:readonly`/`im:resource:upload` 的发布生效、>10 MB 图片规范化、present 交付物在真实客户端的显示、GIF 尺寸边界、附件消息的 uuid 幂等行为均需真机人工验收（自动测试使用 fake 网关与本地 SDK adapter）。
+28. **出站只桥接允许根内的文件**：`present` 交付物与卡片内联图片只读取 Session cwd 或 DSH 附件目录内的普通非空文件；其它位置需要 agent 先复制进 Session 工作区。收敛器先 `realpath` 再按真实路径读取，没有用 `openat`/`O_NOFOLLOW` 消除校验与读取之间的极小 TOCTOU 窗口——威胁模型是共享 Session 被 prompt 注入，而不是同机并发攻击者。
+29. **入站镜像副本共享消息级 60 MB 预算**：多张大图/大文件可能先耗尽预算：文件镜像对其它绑定用户降级为占位文本，图片改用 DSH 规范化副本重传（仍不可用才占位）；DSH 侧 prompt 附件与文本链路不受影响。
 
 ## 8. 自动测试覆盖
 
 fake 测试覆盖：text/post 解析、非法事件、双键去重、prompt 失败重试、并发 FIFO、广播、completed turn 聚合、interrupted 片段与非 completed turn 抑制、DSH/DevLead source 过滤、永久飞书业务码与单收件人失败隔离、稳定 UUID 重试、永久 pending 请求取消、关闭时排队连接、状态原子保存/读取、损坏状态旁置、I/O 错误/非普通文件/超限文件不旁置、读取后按实际字节数复检超限（`stat` 与 `readFile` 之间文件增长）、旁置 rename 失败上抛、初始化前 `update()` 遇旁置恢复后以空状态继续、控制器恢复、并发状态更新、配置连接生命周期、Secret 脱敏、管理 envelope 校验、Client 两个设置 slot 与响应校验。助手卡片部分覆盖：卡片 JSON 2.0 结构与 `[助手]` 标题、单卡不拆分时原文逐字节保留、长回复分片数量/顺序/`(i/n)` 标记、分片 UUID 确定性、每片按含二次转义的请求体估算 ≤24 KB（普通文本与引号/反斜杠密集文本）、代码围栏闭合/重开与未闭合围栏补齐、单行硬切、CRLF 归一、自定义预算、小表格整块保留与大表按行切分不丢行、`230099` 拒绝后同 UUID 纯文本回退且不泄漏卡片 JSON、网络不确定结果同 UUID 重试与回退、`230020`/旧接口 400 限频码与 `11232`/`11233`/`11247` 消息限流码（含 HTTP 400 包裹）可重试且回退分类为 `rejected`、`230002` 永久错误不重试不回退、分片中途永久失败后停止该收件人其余分片、卡片路径 stop 取消、非助手消息仍为 `text`。回显抑制与表情 ack 部分覆盖：飞书 `user/message` 镜像按 `rpcId` 排除发送方 `chat_id` 而其他绑定用户仍收到；`[DSH]` 人类输入与助手最终回复仍全量广播；旧格式 `feishu-omni:<message_id>`（无 `chat_id`）与“解析出的 chat 不在当前 bindings”都退回全量广播；admission 成功后对原始 `message_id` 加固定 `OK` 且只尝试一次；admission 最终失败不加表情并保留既有「消息暂时无法投递」提示；`message_id`/`event_id` 去重命中时不加表情；reaction 失败分类（权限码、限频码、HTTP 429、网络错误、撤回类业务码）正确，缺权限时 prompt 与广播不受影响且只记一条 warning，恢复后记一条 info，失败类别变化会重新告警，ack 挂起时有界超时并会取消在途请求、不会阻塞后续入站；bridge 停止会立即取消挂起的 ack；去重键落盘失败时不加表情（锁定“先落盘后 ack”的顺序）；ack 日志摘要从 axios 风格响应中提取 `code=/status=/msg=`，超长/含换行 msg 截断清洗、非字符串 msg 忽略、凭据脱敏且不泄漏请求体/headers/URL。另以真实 SDK `Client` / `WSClient` 加本地 Axios adapter（无网络）验证 tenant token、text 与 interactive 消息发送、`addReaction` 的 SDK 调用形状与 `/reactions` 端点、WebSocket endpoint 和 `$return_headers` 的响应解包。
-附件部分覆盖：`image`/`file`/`audio`/`media`/`post-img` 事件解析、缺失资源键忽略、图片魔数嗅探（PNG/JPEG/WEBP/GIF 与 HEIC/BMP/TIFF/SVG 识别）、`file_type` 映射（含音频/视频按 `stream` 以匹配 `msg_type=file`）、入站图片下载 → `uploadImageStream` → prompt receipt 的完整形状、文件流式 `uploadStream`、post 多图、下载/暂存/超限/无附件服务/模型不支持图片的降级（不 prompt、不加 OK、落去重键、提示不含本机路径、文本链路不受影响）、入站镜像到其他绑定（图片/文件、占位降级、单收件人失败隔离、UUID 确定性、无其他绑定时不重复上传）、重复投递不重复下载/暂存/prompt/ack、stop 取消挂起下载、1024 个负向边界（真实 SDK adapter 验证 `/im/v1/images`、`/im/v1/files`、`/messages/:id/resources/:key?type=` 的请求形状与解包返回值）。出站部分覆盖：`deliverables/presented` 按 turn 缓冲、completed 先卡片后附件、非 completed 清空缓冲且不投递、文件/图片分类上传、上传一次跨 chat 复用、每 chat 确定性 UUID、缺失/为空/超 30 MB 文件与超 10 MB 图片（规范化/失败）降级、单收件人发送失败同 UUID 文本降级且不影响其他收件人、相对 present 路径按 cwd 解析、同路径去重、助手 Markdown 本地图片改写（相对/绝对/尖括号、URL/image_key/代码围栏/缺失/非图片跳过、>10 MB 规范化、present 去重、上传失败保留原文、重复引用只上传一次、cwd 未知时保留），以及 Controller 层 `session.header.cwd`/`working-directory/change` 到相对路径解析的端到端接线；unknown cwd（`cwd: null`）与 `sessions.list` cwd 回退各有独立用例；deliverable 的瞬时限频重试、永久失败单次降级、多 present 批次合并、空文件/目录、扩展名保留、超长文件名截断、缓冲区上限告警、四反引号/未闭合围栏边界、行内代码 alt 保真、图片交付物多 chat 只上传一次、多分片卡片先于附件发送均有覆盖。
+附件部分覆盖：`image`/`file`/`audio`/`media`/`post-img` 事件解析、缺失资源键忽略、图片魔数嗅探（PNG/JPEG/WEBP/GIF 与 HEIC/BMP/TIFF/SVG 识别）、`file_type` 映射（含音频/视频按 `stream` 以匹配 `msg_type=file`）、入站图片下载 → `uploadImageStream` → prompt receipt 的完整形状、文件流式 `uploadStream`、post 多图、下载/暂存/超限/无附件服务/模型不支持图片的降级（不 prompt、不加 OK、落去重键、提示不含本机路径、文本链路不受影响）、入站镜像到其他绑定（图片/文件、占位降级、单收件人失败隔离、UUID 确定性、无其他绑定时不重复上传）、重复投递不重复下载/暂存/prompt/ack、stop 取消挂起下载、1024 个负向边界（真实 SDK adapter 验证 `/im/v1/images`、`/im/v1/files`、`/messages/:id/resources/:key?type=` 的请求形状与解包返回值）。出站部分覆盖：`deliverables/presented` 按 turn 缓冲、completed 先卡片后附件、非 completed 清空缓冲且不投递、文件/图片分类上传、上传一次跨 chat 复用、每 chat 确定性 UUID、缺失/为空/超 30 MB 文件与超 10 MB 图片（规范化/失败）降级、单收件人发送失败同 UUID 文本降级且不影响其他收件人、相对 present 路径按 cwd 解析、同路径去重、助手 Markdown 本地图片改写（相对/绝对/尖括号、URL/image_key/代码围栏/缺失/非图片跳过、>10 MB 规范化、present 去重、上传失败保留原文、重复引用只上传一次、cwd 未知时保留），以及 Controller 层 `session.header.cwd`/`working-directory/change` 到相对路径解析的端到端接线；unknown cwd（`cwd: null`）与 `sessions.list` cwd 回退各有独立用例；deliverable 的瞬时限频重试、永久失败单次降级、多 present 批次合并、空文件/目录、扩展名保留、超长文件名截断、缓冲区上限告警、四反引号/未闭合围栏边界、行内代码 alt 保真、图片交付物多 chat 只上传一次、多分片卡片先于附件发送均有覆盖。出站路径收敛覆盖：工作区内普通文件、DSH 附件根内文件允许；外部绝对路径、`../` 逃逸、symlink 指向根外拒绝（present 发不含绝对路径的降级文本，inline 保留原 Markdown）；symlink 指向根内允许；workspace 根自身/目录/不存在/空文件分别给出 `not-file`/`missing`/`empty`；`root + sep` 严格前缀边界（`work` 不匹配 `work-escape`）；symlink 作为 Session cwd；4 列缩进（含引用块/列表容器与 tab stop）代码块与转义 `\!` 不改写。另覆盖 DSH `session/attachment-invalid` 的 `reason` 映射（生产形状：上传服务把 `AttachmentError` 包成 RemoteError）与裸 `AttachmentError` code 兜底分类（字节/像素/尺寸/格式/数据无效/数量、cause 包裹、存储类错误仍走通用文案）、admission `RemoteError` 同码映射、引用块/列表容器与 tab stop 下的缩进代码不被改写、偶数反斜杠后的图片仍改写、附件镜像无扩展名/点文件补 `.bin` 且 `file_type` 按最终名重算、attachment root 查询抛错时 fail-closed、workspace 与附件根都未知时的 `no-roots` 提示、turn 结束后迟到的 `deliverables/presented` 被忽略且不投递。
 
 测试边界：`tests/host-adapters.spec.ts` 的 Cordis `Context` 和 Session Controller 全部是 mock，只验证本插件构造的 list/prompt 调用形状；安装版签名兼容性来自对目标 ASAR 源码的只读核对，不等同于真实 Host 集成测试。SDK 测试也只使用本地 HTTP adapter，不验证飞书实际权限、事件投递或 WebSocket 服务行为。依赖 `chmod` 权限位的用例在 root 与 Windows 上自动跳过，POSIX `0600` mode 断言在 Windows 上不执行（Windows 上 chmod 不阻止读取或改名，`stat` 的 mode 也是合成值）。
 
@@ -437,7 +439,7 @@ im.message.receive_v1
 
 - **下载**：`client.im.v1.messageResource.get({path:{message_id, file_key}, params:{type}})` 返回 `getReadableStream()`；插件只读取到 64 字节作为“可嗅探 head”，`data` 迭代器先重放 head 再流式转发剩余字节，保证不丢字节也无需整文件缓冲（图片除外，见下）。文件类型 `type` 是 query 参数，音频/视频都用 `file`。头部嗅探只用于**图片**（文件不需要魔数分类），因此文件全程流式。
 - **图片**：为在调用 `uploadImageStream` 前确定 `mediaType`，先把 ≤20 MB 图片整体读入内存；魔数只接受 PNG/JPEG/WEBP/GIF（与 DSH `attachment-local` 的 `mediaTypes` 完全一致）。HEIC/BMP/TIFF/SVG 及其他未知格式直接降级，不进入 DSH。
-- **文件**：`collectingStream` 在转发的同时统计总字节（>100 MB 抛 `too-large`）并保留至多 30 MB 副本（超过即丢弃副本），用于后续 Feishu 二次上传；因此 100 MB 文件不会在内存里翻倍。
+- **文件**：`collectingStream` 在转发的同时统计总字节（>100 MB 抛 `too-large`）并保留至多 30 MB 副本（超过即丢弃副本），用于后续 Feishu 二次上传；一条消息内所有附件的镜像副本共享 **60 MB** 预算（`MAX_INBOUND_MIRROR_BYTES`），预算用尽后的附件不再保留原始副本：文件镜像降级为占位文本，图片改用 DSH 规范化后的 prompt 副本重传（仍不可用才占位）；因此 100 MB 文件不会在内存里翻倍。
 - **prompt 文本**：保留 `[飞书 · label]` 前缀，正文追加占位 `（图片）`/`（文件：name）`/`（音频）`/`（视频：name）`，让文本镜像与其他用户也能理解这条消息带了附件；agent 侧真正的内容来自原生 ImageBlock/FileBlock。
 - **附件命名**：文件名只用于 DSH 展示、飞书上传和占位文本，永不拼路径；控制字符与 `/`、`\` 会被清洗，长度截断到 120 字符；无扩展名时文件回退为 `file.bin`、音频回退 `audio.opus`、视频回退 `video.mp4`。
 - **DSH 侧上限**：安装版 `attachment-local` 默认 50 MiB/图、20 图/消息、200 MiB/消息；插件把入站图片上限收紧到 20 MB（避免大图长期占用 FIFO 与内存），文件上限 100 MB（飞书单次下载上限）。
@@ -452,7 +454,9 @@ im.message.receive_v1
 | 图片格式 HEIC/BMP/TIFF/SVG/未知 | `图片格式 HEIC 暂不支持，支持 PNG/JPEG/WEBP/GIF…` | 不投递 | 不加 | 写入 |
 | 图片 >20 MB / 文件 >100 MB | `附件超过大小限制（图片 ≤20.0 MB，文件 ≤100.0 MB）…` | 不投递 | 不加 | 写入 |
 | 无 `fileUploads` 服务（非标准 composition） | `附件无法写入 DSH 附件服务…` | 不投递 | 不加 | 写入 |
-| DSH 拒绝（模型无视觉/图片超 DSH 上限/媒体类型不合法） | 模型无视觉时专门提示；其他为 `附件未能被 Session 接收…` | 不投递 | 不加 | 写入 |
+| DSH 拒绝（模型无视觉/媒体类型不合法/图片数量或聚合超限） | 模型无视觉时专门提示；其他为 `附件未能被 Session 接收…` | 不投递 | 不加 | 写入 |
+| DSH 图片字节/像素/尺寸/格式拒绝（`session/attachment-invalid` 的 `reason`；裸 `AttachmentError` code 作为兜底） | 按 code 给具体提示：超过 DSH 字节上限 / 像素或尺寸超限 / 格式不支持 / 图片数据无效 / 图片数量超限 | 不投递 | 不加 | 写入 |
+| `present`/内联图片路径不在允许根（Session 工作区或 DSH 附件目录） | `present` 发文本降级（文件名+大小+原因，不含绝对路径）；内联保留原 Markdown | 不涉及 | 不涉及 | 不涉及 |
 | 传输级 admission 失败（非附件原因） | 既有 `消息暂时无法投递…` | 不投递 | 不加 | 不写（可重投恢复） |
 
 降级提示统一为 `[Feishu Omni] …` 纯文本，只含格式/大小/原因，不含字节、本机路径或 Secret；降级路径不再调用 prompt，因此不会出现“消息提示失败但 Session 已收到半条”的情况。文本消息路径完全不受影响。
@@ -461,8 +465,8 @@ im.message.receive_v1
 
 - 与文本镜像同规则：**除发送者外的全部绑定 chat** 收到这条图片/文件；发送者本人不回显。
 - 图片：优先用原始字节（≤10 MB）调用 `image.create`；>10 MB 时回退到读取 DSH 已规范化的 prompt 副本（`uploadImageStream` 返回的 `image` ref → `attachments.readImage`，DSH 规范化后 ≤4 MB），仍不可用则占位。
-- 文件：使用 ≤30 MB 的收集副本 + `file_type` 映射；音频/视频刻意用 `stream`（飞书要求 file_type 与 msg_type 匹配，`opus`/`mp4` 必须配 audio/media 消息，否则 230055）。
-- 每个资源只上传一次，跨绑定复用 key；每 chat UUID = `sha256("attach:" + message_id + ":" + chat_id + ":" + index)` 前 40 位；上传/发送失败只记日志并降级为 `[图片]` / `[文件: name]` / `[音频]` / `[视频: name]` 文本，不写 Settings 错误、不阻塞其他绑定。
+- 文件：使用 ≤30 MB 的收集副本 + `file_type` 映射；音频/视频刻意用 `stream`（飞书要求 file_type 与 msg_type 匹配，`opus`/`mp4` 必须配 audio/media 消息，否则 230055）。收集副本与同消息其他附件共享 60 MB 预算（见 11.2）：预算耗尽时文件镜像降级为占位文本，图片优先用 DSH 规范化后的 prompt 副本重传。
+- 每个资源只上传一次，跨绑定复用 key；每 chat UUID = `sha256("attach:" + message_id + ":" + chat_id + ":" + index)` 前 40 位；上传/发送失败按可重试码（限频/超时/5xx）指数退避重试，重试耗尽或永久错误后才记日志并降级为 `[图片]` / `[文件: name]` / `[音频]` / `[视频: name]` 文本，不写 Settings 错误、不阻塞其他绑定。
 - 只有存在其他绑定时才做镜像上传（单用户场景没有额外 OpenAPI 调用）。
 
 ### 11.5 出站交付物（present）
@@ -473,7 +477,9 @@ im.message.receive_v1
 deliverables/presented → pendingPresented.set(turn, merge(files))   // 按 path 去重，单 turn 最多 32 个
 turn/end(completed) → 先 broadcastAssistant(最终文本，含内联图片改写)
                     → sendDeliverables(files)
-                       每个文件：resolve 路径 → stat（普通文件、非空）→ 读字节（≤50MB）
+                       每个文件：按 cwd 解析相对路径 → realpath 收敛
+                          → 真实路径必须位于 Session cwd / DSH 附件根内（严格前缀）
+                          → 普通文件、非空 → 读字节（≤50MB）
                          魔数 = PNG/JPEG/WEBP/GIF → 图片路径：≤10MB 直接 image.create，
                            否则/被拒 → attachments.saveImage+readImage 规范化 → image.create
                          其他 → ≤30MB file.create(file_type = pdf/doc/xls/ppt/stream)
@@ -484,9 +490,11 @@ turn/end(非 completed) → 清空该 turn 的 present 缓冲，不发送
 - 顺序：同一 turn 内**先**助手卡片、**后**交付物；同一收件人/文件内部串行。
 - 传输重试：交付物的 `uploadImage`/`uploadFile`/`sendImage`/`sendFile` 与降级文本都走与卡片相同的“可重试码指数退避、同一 UUID”策略；只有重试耗尽或永久错误才降级为文本。
 - 缓冲上限：单 turn 最多保留 32 个 present 文件（`present` 默认每次最多 8 个，但可配置且可多次调用）；超过时记 warning 并丢弃多余文件，不静默扩大内存。
+- 迟到的 present：`turn/end` 之后才到达的 `deliverables/presented`（事件重放/乱序）不再缓冲、不投递，只记 warning；已结束 turn 的集合有界（最多 256 条），避免 `pendingPresented` 随历史 turn 常驻。
 - 文件名：显示/上传名取 basename、清洗控制字符并截断到 120 字符；截断保留扩展名，无扩展名的文件上传时补 `.bin`（飞书要求 `file_name` 带后缀）。
 - UUID：`sha256(turn 事件键 + ":" + chat_id + ":deliverable:" + index)`；发送失败后的文本降级复用同一 UUID。
-- 降级提示 `[Feishu Omni] 交付物「name」（大小）未发送：原因`，原因包括文件不存在/不是普通文件/为空/超过 30 MB/读取失败/图片无法规范化/飞书上传失败/发送失败；**不发本机路径**（对其他用户没有意义，也避免泄漏本机目录结构）。
+- 降级提示 `[Feishu Omni] 交付物「name」（大小）未发送：原因`，原因包括文件不存在/不是普通文件/为空/超过 30 MB/读取失败/图片无法规范化/飞书上传失败/发送失败/**文件不在会话工作区或 DSH 附件目录内**；**不发本机路径**（对其他用户没有意义，也避免泄漏本机目录结构）。
+- **路径白名单（防注入外发）**：插件用 Node fs 直接读取本地文件、绕过 DSH 沙箱；共享 Session 一旦被 prompt 注入，不能让它把本机任意文件上传给所有绑定飞书用户。因此 `sendDeliverables` 与 inline 改写共用 `src/paths.ts` 的收敛器：① 相对路径按 Session cwd 解析；② `fs.realpath` 解析全部 symlink 并统一 on-disk 大小写；③ 真实路径必须**等于**某个允许根或以其 `根 + path.sep` 开头（不用裸 `startsWith`，避免 `/work-escape` 冒充 `/work`）；④ `stat` 确认普通文件、非空（`realpath` 已消解 symlink）。允许根为 Session cwd 与 DSH 附件根（`ctx.attachments.root` 优先，否则 `$DSH_HOME/attachments/v1`）。symlink 只有指向根内才允许；指向根外一律拒绝。拒绝时 present 只发降级文本（文件名/best-effort 大小/原因），inline 保留原 Markdown；两者都不读取也不上传字节。Agent 要发其它位置的文件，应先把文件复制进 Session 工作区。
 - 上传失败/超限只影响该文件与收件人，不阻塞后续文件与其他 chat。
 - `present` 的路径通常已经是绝对路径（`ctx.fs.processPath`）；相对路径按 Session cwd 解析。
 
@@ -494,15 +502,16 @@ turn/end(非 completed) → 清空该 turn 的 present 缓冲，不发送
 
 助手最终的 Markdown 卡片发送前，插件扫描**行内**图片语法 `![alt](<path>)` / `![alt](path)`：
 
-1. 跳过 fenced code block 内的行（与卡片分片相同的 CommonMark 0–3 空格围栏识别）与行内代码 span，避免把示例文本里的语法当图片；
+1. 跳过 fenced code block（与卡片分片相同的 CommonMark 0–3 空格围栏识别）、4 列缩进的 CommonMark 代码块（tab 按 4 列 tab stop 展开；引用块 `>` 与列表项容器内的 4 列缩进同样识别）、行内代码 span（`` `...` ``），以及反斜杠转义的 `\![alt](path)`（奇数个反斜杠为转义，偶数个反斜杠后图片仍生效），避免把示例或字面量当图片；
 2. 跳过 HTTP(S)/其它 scheme URL、`#` 锚点、已经是 `img_*` 的引用；
 3. 相对路径按 Session cwd 解析（`session.header.cwd` / `working-directory/change`，缺失时退回 `sessionController.list`）；
-4. 必须存在且是普通文件、≤50 MB、魔数属于四种图片格式；
-5. ≤10 MB 直接 `image.create`；否则或直传被拒时用 `attachments.saveImage` 规范化后重传；
-6. 同一路径只上传一次，多引用复用同一 `image_key`；
-7. 本 turn 的 `present` 列表里已出现的路径**不做内联**（present 会发真正的图片消息，避免同图两处显示）；
-8. 任一步失败（不存在/非图片/上传失败/规范化失败）→ 保留原始 Markdown；
-9. 改写后重新走 `splitAssistantMarkdown`，24 KB 预算与分片/UUID 逻辑不变。
+4. 相对/绝对路径统一 `realpath` 收敛（解析 symlink、统一大小写），真实路径必须严格位于允许根内：Session cwd 或 DSH 附件根（`ctx.attachments.root` 优先，否则 `$DSH_HOME/attachments/v1`）；symlink 指向根外一律拒绝；
+5. 必须存在且是普通非空文件、≤50 MB、魔数属于四种图片格式；
+6. ≤10 MB 直接 `image.create`；否则或直传被拒时用 `attachments.saveImage` 规范化后重传；
+7. 同一真实路径只上传一次，多引用复用同一 `image_key`；
+8. 本 turn 的 `present` 列表里已出现的路径（按真实路径比较）**不做内联**（present 会发真正的图片消息，避免同图两处显示）；
+9. 任一步失败（不存在/根外/非图片/上传失败/规范化失败）→ 保留原始 Markdown；上传失败或 present 去重时卡片只保留 `![alt](<path>)` 文本，**不含也不会发送本机字节**，这是预期行为；
+10. 改写后重新走 `splitAssistantMarkdown`，24 KB 预算与分片/UUID 逻辑不变。
 
 设计取舍：优先保证“不破坏原文”——改写失败时飞书客户端会把它当普通图片链接，最坏显示为破图/路径文本，而不是丢失助手内容；不改写纯文件链接、不自动把 `[说明](<path>)` 的文件推成附件，避免刷屏。
 
@@ -520,4 +529,4 @@ turn/end(非 completed) → 清空该 turn 的 present 缓冲，不发送
 
 ### 11.8 已知限制与未验证项
 
-见第 7 节第 15–24 条（模型视觉能力、附件永不清理、100 MB/30 MB/10 MB 上限、群聊、GIF 尺寸、`file_type`/`msg_type` 匹配、相对路径与 cwd 滞后、大附件阻塞 FIFO、镜像 best effort）与第 11.4 节的音频/视频按文件发送说明。自动测试不访问真实飞书；以下需要在真实租户人工验收：`im:message:readonly`/`im:resource:upload` 的发布与生效、HEIC/BMP/TIFF 拒绝提示文案、>10 MB 图片规范化后的 Feishu 显示、present 交付物在客户端的渲染（图片预览/文件卡片）、GIF 尺寸边界、附件消息的 UUID 幂等行为、模型视觉能力（上游模型决定）。
+见第 7 节第 15–29 条（模型视觉能力、附件永不清理、100 MB/30 MB/10 MB 上限、群聊、GIF 尺寸、`file_type`/`msg_type` 匹配、相对路径与 cwd 滞后、大附件阻塞 FIFO、镜像 best effort）与第 11.4 节的音频/视频按文件发送说明。自动测试不访问真实飞书；以下需要在真实租户人工验收：`im:message:readonly`/`im:resource:upload` 的发布与生效、HEIC/BMP/TIFF 拒绝提示文案、>10 MB 图片规范化后的 Feishu 显示、present 交付物在客户端的渲染（图片预览/文件卡片）、GIF 尺寸边界、附件消息的 UUID 幂等行为、模型视觉能力（上游模型决定）。

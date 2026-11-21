@@ -395,6 +395,16 @@ export const PNG_BYTES = Buffer.from(
   'base64',
 )
 
+/**
+ * A DSH `AttachmentError`-shaped fixture for classification tests. DSH's real
+ * class extends `HarnessError` and carries `name='AttachmentError'` plus a stable
+ * string `code`; consumers identify it structurally, so an `Error` with those
+ * two fields is the exact shape that crosses a package boundary.
+ */
+export function attachmentError(code: string, message = `attachment rejected: ${code}`): Error {
+  return Object.assign(new Error(message), { name: 'AttachmentError', code })
+}
+
 /** Minimal GIF89a header; enough for format sniffing fixtures. */
 export const GIF_BYTES = Buffer.from('GIF89a\x01\x00\x01\x00\x00\x00\x00;', 'binary')
 

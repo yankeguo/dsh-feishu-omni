@@ -76,6 +76,86 @@ export function attachmentRejectionReason(error: unknown): string | undefined {
   return typeof details?.reason === 'string' && details.reason.trim() ? details.reason : 'UNKNOWN'
 }
 
+/**
+ * Stable codes of DSH's `AttachmentError` (`@deepseek-ai/dsh-attachment`, rc.5).
+ * Kept closed on purpose: an unknown string `code` on a foreign error must never
+ * be misread as an attachment admission failure.
+ */
+const ATTACHMENT_ERROR_CODES: ReadonlySet<string> = new Set([
+  'TOO_MANY_IMAGES',
+  'IMAGES_TOO_LARGE',
+  'UNSUPPORTED_IMAGE_TYPE',
+  'INVALID_IMAGE_BASE64',
+  'INVALID_IMAGE',
+  'IMAGE_TYPE_MISMATCH',
+  'IMAGE_TOO_LARGE',
+  'IMAGE_TOO_MANY_PIXELS',
+  'IMAGE_DIMENSION_TOO_LARGE',
+  'INVALID_FILE_BASE64',
+  'INVALID_ATTACHMENT_REF',
+  'ATTACHMENT_CORRUPT',
+  'ATTACHMENT_WRITE_FAILED',
+  'ATTACHMENT_NOT_FOUND',
+  'ATTACHMENT_READ_FAILED',
+  'ATTACHMENT_PROJECTION_UNSUPPORTED',
+  'ATTACHMENT_FILES_UNSUPPORTED',
+])
+
+/**
+ * Identify a DSH `AttachmentError` by its stable code. Discrimination is
+ * structural, never `instanceof`: the attachment service and this plugin may
+ * hold duplicate package copies, and DSH's own `isAttachmentError` helper
+ * matches the code for exactly that reason.
+ *
+ * DSH 0.2.2-rc.5 `ctx.fileUploads` already re-wraps an `AttachmentError` into
+ * `RemoteError('session/attachment-invalid', { reason: code })`, so the normal
+ * bridge path classifies that {@link attachmentRejectionReason} instead. This
+ * classifier is the cross-package/raw-error fallback (and follows a wrapped
+ * `cause` chain) so a backend that surfaces the original error is still mapped
+ * to a specific notice rather than the generic failure text.
+ */
+export function attachmentErrorCode(error: unknown): string | undefined {
+  let current: unknown = error
+  for (let depth = 0; depth < 4; depth += 1) {
+    if (typeof current !== 'object' || current === null) return undefined
+    const code = (current as { code?: unknown }).code
+    if (typeof code === 'string' && ATTACHMENT_ERROR_CODES.has(code)) return code
+    current = (current as { cause?: unknown }).cause
+  }
+  return undefined
+}
+
+/** Caller-correctable image admission classes that deserve a specific notice. */
+export type AttachmentRejectionClass =
+  | 'image-bytes'
+  | 'image-pixels'
+  | 'unsupported-image'
+  | 'invalid-image'
+  | 'too-many-images'
+
+const IMAGE_BYTE_LIMIT_CODES: ReadonlySet<string> = new Set(['IMAGE_TOO_LARGE', 'IMAGES_TOO_LARGE'])
+const IMAGE_PIXEL_LIMIT_CODES: ReadonlySet<string> = new Set([
+  'IMAGE_TOO_MANY_PIXELS', // pixel-count limit
+  'IMAGE_DIMENSION_TOO_LARGE', // single-edge limit
+])
+const UNSUPPORTED_IMAGE_CODES: ReadonlySet<string> = new Set(['UNSUPPORTED_IMAGE_TYPE'])
+const INVALID_IMAGE_CODES: ReadonlySet<string> = new Set([
+  'INVALID_IMAGE',
+  'INVALID_IMAGE_BASE64',
+  'IMAGE_TYPE_MISMATCH',
+])
+const TOO_MANY_IMAGES_CODES: ReadonlySet<string> = new Set(['TOO_MANY_IMAGES'])
+
+/** Classify one stable attachment code for sender-facing degradation text. */
+export function attachmentErrorClass(code: string): AttachmentRejectionClass | undefined {
+  if (IMAGE_BYTE_LIMIT_CODES.has(code)) return 'image-bytes'
+  if (IMAGE_PIXEL_LIMIT_CODES.has(code)) return 'image-pixels'
+  if (UNSUPPORTED_IMAGE_CODES.has(code)) return 'unsupported-image'
+  if (INVALID_IMAGE_CODES.has(code)) return 'invalid-image'
+  if (TOO_MANY_IMAGES_CODES.has(code)) return 'too-many-images'
+  return undefined
+}
+
 const PERMANENT_PROVIDER_CODES = new Set([
   230002, // The bot is outside the target chat; retrying cannot restore membership.
   99991661,

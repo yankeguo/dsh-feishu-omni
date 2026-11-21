@@ -19,6 +19,11 @@ export interface OmniControllerOptions {
   readonly fileUploads?: FileUploadPort
   /** DSH attachment store for outbound image normalization. */
   readonly attachments?: AttachmentPort
+  /**
+   * Additional allowed upload roots (the DSH attachment store). Outbound files
+   * outside the Session cwd and these roots are never read or uploaded.
+   */
+  readonly attachmentRoots?: () => readonly string[]
 }
 
 /** Owns configuration transitions and the single live bridge generation. */
@@ -234,6 +239,7 @@ export class OmniController {
         sessionCwd: id => this.sessionCwds.get(id),
         ...(this.options.fileUploads === undefined ? {} : { fileUploads: this.options.fileUploads }),
         ...(this.options.attachments === undefined ? {} : { attachments: this.options.attachments }),
+        ...(this.options.attachmentRoots === undefined ? {} : { attachmentRoots: this.options.attachmentRoots }),
         onError: error => {
           if (generation === this.generation) this.rememberError(error)
         },

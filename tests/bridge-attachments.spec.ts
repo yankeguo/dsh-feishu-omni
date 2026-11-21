@@ -5,7 +5,7 @@ import { emptyState, MemoryStateStore } from '../src/state.ts'
 import type { Binding, AttachmentPort, FileUploadPort } from '../src/types.ts'
 import {
   FakeAttachments, FakeFileUploads, FakeGateway, FakeSessions, feishuEvent, GIF_BYTES, HEIC_BYTES,
-  JPEG_BYTES, PNG_BYTES, SESSION,
+  JPEG_BYTES, PNG_BYTES, SESSION, attachmentError,
 } from './helpers.ts'
 
 const alice: Binding = { openId: 'ou_alice', chatId: 'oc_alice', label: 'Alice', createdAt: '2026-01-01', updatedAt: '2026-01-01' }
@@ -314,6 +314,86 @@ describe('OmniBridge inbound images', () => {
   })
 })
 
+describe('DSH attachment rejection degradation', () => {
+  it.each([
+    ['IMAGE_TOO_LARGE', '字节上限'],
+    ['IMAGE_TOO_MANY_PIXELS', '像素或尺寸'],
+    ['IMAGE_DIMENSION_TOO_LARGE', '像素或尺寸'],
+    ['UNSUPPORTED_IMAGE_TYPE', 'PNG/JPEG/WEBP/GIF'],
+  ])('maps a raw AttachmentError %s to a specific notice', async (code, expected) => {
+    const { bridge, sessions, gateway, fileUploads } = setup()
+    // DSH rc.5 wraps AttachmentError into a RemoteError before it crosses
+    // `ctx.fileUploads`; the raw shape is still classified structurally as a
+    // fallback for other/older compositions and backend implementations.
+    fileUploads?.failures.push(attachmentError(code))
+    gateway.downloads.set('img_v3_1', PNG_BYTES)
+    await bridge.receive(imageEvent())
+    await bridge.drain()
+    expect(fileUploads?.imageUploads).toHaveLength(1)
+    expect(sessions.prompts).toEqual([])
+    expect(gateway.reactionAttempts).toEqual([])
+    expect(gateway.sent[0]?.text).toContain(expected)
+    // The generic fallback text ("attachment service failed") must not win.
+    expect(gateway.sent[0]?.text).not.toContain('附件无法写入')
+  })
+
+  it('classifies a wrapped in-process AttachmentError through its cause chain', async () => {
+    const { bridge, sessions, gateway, fileUploads } = setup()
+    fileUploads?.failures.push(
+      Object.assign(new Error('gateway/internal'), { cause: attachmentError('IMAGE_TOO_MANY_PIXELS') }),
+    )
+    gateway.downloads.set('img_v3_1', PNG_BYTES)
+    await bridge.receive(imageEvent())
+    await bridge.drain()
+    expect(sessions.prompts).toEqual([])
+    expect(gateway.sent[0]?.text).toContain('像素或尺寸')
+  })
+
+  it('maps the production shape (RemoteError reason from the upload service) to a specific notice', async () => {
+    const { bridge, sessions, gateway, fileUploads } = setup()
+    // rc.5 `FileUploads.store()` rethrows AttachmentError as
+    // RemoteError('session/attachment-invalid', { reason: code }); this is the
+    // shape the real Host produces for IMAGE_TOO_LARGE / IMAGE_TOO_MANY_PIXELS.
+    fileUploads?.failures.push(Object.assign(new Error('Image exceeds the configured byte limit.'), {
+      isDSHRemoteError: true,
+      code: 'session/attachment-invalid',
+      details: { reason: 'IMAGE_TOO_LARGE' },
+    }))
+    gateway.downloads.set('img_v3_1', PNG_BYTES)
+    await bridge.receive(imageEvent())
+    await bridge.drain()
+    expect(sessions.prompts).toEqual([])
+    expect(gateway.reactionAttempts).toEqual([])
+    expect(gateway.sent[0]?.text).toContain('字节上限')
+  })
+
+  it('keeps the generic notice for a storage AttachmentError code', async () => {
+    const { bridge, sessions, gateway, fileUploads } = setup()
+    fileUploads?.failures.push(attachmentError('ATTACHMENT_WRITE_FAILED'))
+    gateway.downloads.set('img_v3_1', PNG_BYTES)
+    await bridge.receive(imageEvent())
+    await bridge.drain()
+    expect(sessions.prompts).toEqual([])
+    expect(gateway.sent[0]?.text).toContain('附件服务')
+  })
+
+  it('maps a DSH prompt-admission image limit to the same specific notice', async () => {
+    const { bridge, sessions, gateway } = setup()
+    sessions.promptHook = async () => {
+      throw Object.assign(new Error('image pixels exceed the limit'), {
+        isDSHRemoteError: true,
+        code: 'session/attachment-invalid',
+        details: { reason: 'IMAGE_TOO_MANY_PIXELS' },
+      })
+    }
+    gateway.downloads.set('img_v3_1', PNG_BYTES)
+    await bridge.receive(imageEvent())
+    await bridge.drain()
+    expect(gateway.reactionAttempts).toEqual([])
+    expect(gateway.sent[0]?.text).toContain('像素或尺寸')
+  })
+})
+
 describe('OmniBridge inbound files', () => {
   it('streams a file into the attachment service and prompts with a file receipt', async () => {
     const { bridge, sessions, gateway, fileUploads } = setup()
@@ -496,6 +576,28 @@ describe('OmniBridge inbound attachment mirror', () => {
     await bridge.drain()
     expect(gateway.imageUploads).toEqual([])
     expect(gateway.sent).toEqual([{ chatId: 'oc_bob', text: '[图片]', uuid: expect.stringMatching(/^dshfo_/) }])
+  })
+
+  it('adds a .bin suffix when mirroring an extension-less file name', async () => {
+    const { bridge, gateway } = setup({ bindings: [alice, bob] })
+    gateway.downloads.set('file_v3_1', Buffer.from('readme bytes'))
+    // Feishu documents that an uploaded file_name must carry a suffix; an
+    // inbound file named `README` has none.
+    await bridge.receive(feishuEvent({ messageType: 'file', content: { file_key: 'file_v3_1', file_name: 'README' } }))
+    await bridge.drain()
+    expect(gateway.uploadedFileRequests).toMatchObject([{ name: 'README.bin', fileType: 'stream' }])
+    expect(gateway.files).toHaveLength(1)
+  })
+
+  it('treats a dotfile as extension-less when mirroring it', async () => {
+    const { bridge, gateway } = setup({ bindings: [alice, bob] })
+    gateway.downloads.set('file_v3_1', Buffer.from('KEY=value'))
+    await bridge.receive(feishuEvent({ messageType: 'file', content: { file_key: 'file_v3_1', file_name: '.env' } }))
+    await bridge.drain()
+    // `.env` has no suffix after the leading dot, so the upload name and the
+    // derived file_type must agree (`.env.bin` -> stream, not a document type).
+    expect(gateway.uploadedFileRequests).toMatchObject([{ name: '.env.bin', fileType: 'stream' }])
+    expect(gateway.files).toHaveLength(1)
   })
 
   it('mirrors a message with no other binding without uploading anything', async () => {

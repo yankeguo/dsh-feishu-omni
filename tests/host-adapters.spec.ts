@@ -1,7 +1,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { SessionPromptRequest } from '@deepseek-ai/dsh-api-session-controller'
 import { describe, expect, it, vi } from 'vitest'
-import { DshAttachmentPort, DshFileUploadPort, DshSessionPort } from '../src/host-adapters.ts'
+import { DshAttachmentPort, DshFileUploadPort, DshSessionPort, dshAttachmentRoot } from '../src/host-adapters.ts'
 
 describe('DshSessionPort', () => {
   it('lists ordinary Sessions with display titles and submits queue prompts with request identity', async () => {
@@ -122,5 +122,16 @@ describe('DshAttachmentPort', () => {
     expect(saveImage).toHaveBeenCalledWith({ data: new Uint8Array([1]), mediaType: 'image/png' })
     expect(readImage).toHaveBeenCalledWith({ ref: 'saved' }, undefined)
     expect(DshAttachmentPort.from(fakeCtx({}))).toBeUndefined()
+  })
+})
+
+describe('dshAttachmentRoot', () => {
+  it('returns the mounted store root and ignores services without one', () => {
+    expect(dshAttachmentRoot(fakeCtx({
+      attachments: { root: '/home/u/.dsh/attachments/v1', saveImage: vi.fn(), readImage: vi.fn() },
+    }))).toBe('/home/u/.dsh/attachments/v1')
+    expect(dshAttachmentRoot(fakeCtx({ attachments: { saveImage: vi.fn() } }))).toBeUndefined()
+    expect(dshAttachmentRoot(fakeCtx({ attachments: { root: '   ' } }))).toBeUndefined()
+    expect(dshAttachmentRoot(fakeCtx({}))).toBeUndefined()
   })
 })

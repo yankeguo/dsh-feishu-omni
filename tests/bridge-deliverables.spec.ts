@@ -1,4 +1,4 @@
-import { mkdtemp, rm, truncate, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, symlink, truncate, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -33,6 +33,9 @@ interface SetupOptions {
   readonly attachments?: FakeAttachments | null
   readonly fileUploads?: FakeFileUploads | null
   readonly sessionCwd?: (sessionId: string) => string | undefined
+  /** Shorthand: make this directory the Session workspace root. */
+  readonly cwd?: string
+  readonly attachmentRoots?: () => readonly string[]
   readonly attachmentTimeoutMs?: number
   readonly sessions?: FakeSessions
 }
@@ -53,6 +56,8 @@ function setup(options: SetupOptions = {}) {
     warn: (message: string) => { logs.push({ level: 'warn', message }) },
     error: (message: string) => { logs.push({ level: 'error', message }) },
   }
+  const sessionCwd = options.sessionCwd
+    ?? (options.cwd === undefined ? undefined : () => options.cwd as string)
   const bridge = new OmniBridge({
     state, sessions, gateway, logger,
     retry: { attempts: 3, baseDelayMs: 10, maxDelayMs: 100 },
@@ -60,9 +65,15 @@ function setup(options: SetupOptions = {}) {
     ...(options.attachmentTimeoutMs === undefined ? {} : { attachmentTimeoutMs: options.attachmentTimeoutMs }),
     ...(options.attachments === null ? {} : { attachments: attachments as AttachmentPort }),
     ...(options.fileUploads === null ? {} : { fileUploads: fileUploads as FileUploadPort }),
-    ...(options.sessionCwd === undefined ? {} : { sessionCwd: options.sessionCwd }),
+    ...(sessionCwd === undefined ? {} : { sessionCwd }),
+    ...(options.attachmentRoots === undefined ? {} : { attachmentRoots: options.attachmentRoots }),
   })
   return { state, sessions, gateway, attachments, fileUploads, bridge, logs }
+}
+
+/** Setup with the test's temporary directory as the Session workspace root. */
+function setupInDir(dir: string, options: Omit<SetupOptions, 'cwd' | 'sessionCwd'> = {}) {
+  return setup({ ...options, cwd: dir })
 }
 
 async function turnWithPresent(
@@ -82,7 +93,7 @@ describe('OmniBridge present deliverables', () => {
     const dir = await tempDir()
     const file = join(dir, 'report.pdf')
     await writeFile(file, '%PDF-1.7 fixture')
-    const { bridge, gateway } = setup({ bindings: [alice, bob] })
+    const { bridge, gateway } = setupInDir(dir, { bindings: [alice, bob] })
     const order: string[] = []
     const markdown = gateway.sendMarkdown.bind(gateway)
     gateway.sendMarkdown = async (...args) => {
@@ -108,7 +119,7 @@ describe('OmniBridge present deliverables', () => {
     const dir = await tempDir()
     const file = join(dir, 'a.pdf')
     await writeFile(file, '%PDF')
-    const { bridge, gateway } = setup()
+    const { bridge, gateway } = setupInDir(dir)
     await bridge.sessionEvent(SESSION.sessionId, presentedEvent(1, 1, [{ path: file }]))
     await bridge.drain()
     expect(gateway.uploadedFileRequests).toEqual([])
@@ -124,9 +135,9 @@ describe('OmniBridge present deliverables', () => {
     const dir = await tempDir()
     const file = join(dir, 'a.pdf')
     await writeFile(file, '%PDF')
-    const first = setup({ bindings: [alice, bob] })
+    const first = setupInDir(dir, { bindings: [alice, bob] })
     await turnWithPresent(first.bridge, 'done', [{ path: file }])
-    const second = setup({ bindings: [alice, bob] })
+    const second = setupInDir(dir, { bindings: [alice, bob] })
     await turnWithPresent(second.bridge, 'done', [{ path: file }])
     expect(first.gateway.files.map(row => row.uuid)).toEqual(second.gateway.files.map(row => row.uuid))
     expect(first.gateway.cards.map(row => row.uuid)).toEqual(second.gateway.cards.map(row => row.uuid))
@@ -136,7 +147,7 @@ describe('OmniBridge present deliverables', () => {
     const dir = await tempDir()
     const file = join(dir, 'a.pdf')
     await writeFile(file, '%PDF')
-    const { bridge, gateway } = setup()
+    const { bridge, gateway } = setupInDir(dir)
     await bridge.sessionEvent(SESSION.sessionId, assistantEvent(1, 'partial', 1))
     await bridge.sessionEvent(SESSION.sessionId, presentedEvent(2, 1, [{ path: file }]))
     await bridge.sessionEvent(SESSION.sessionId, turnEnd(3, 1, { kind: 'aborted' }))
@@ -153,7 +164,7 @@ describe('OmniBridge present deliverables', () => {
     const dir = await tempDir()
     const file = join(dir, 'chart.png')
     await writeFile(file, PNG_BYTES)
-    const { bridge, gateway, fileUploads } = setup()
+    const { bridge, gateway, fileUploads } = setupInDir(dir)
     await turnWithPresent(bridge, undefined, [{ path: file }])
     expect(gateway.imageUploads).toHaveLength(1)
     expect(Buffer.from(gateway.imageUploads[0]?.bytes ?? [])).toEqual(PNG_BYTES)
@@ -168,7 +179,7 @@ describe('OmniBridge present deliverables', () => {
     const dir = await tempDir()
     const good = join(dir, 'good.txt')
     await writeFile(good, 'hello')
-    const { bridge, gateway } = setup({ bindings: [alice, bob] })
+    const { bridge, gateway } = setupInDir(dir, { bindings: [alice, bob] })
     await turnWithPresent(bridge, 'done', [
       { path: join(dir, 'missing.pdf') },
       { path: good },
@@ -188,7 +199,7 @@ describe('OmniBridge present deliverables', () => {
     const big = join(dir, 'big.bin')
     await writeFile(big, '')
     await truncate(big, 30 * 1024 * 1024 + 1)
-    const { bridge, gateway } = setup()
+    const { bridge, gateway } = setupInDir(dir)
     await turnWithPresent(bridge, undefined, [{ path: big }])
     expect(gateway.uploadedFileRequests).toEqual([])
     expect(gateway.sent).toHaveLength(1)
@@ -202,7 +213,7 @@ describe('OmniBridge present deliverables', () => {
     await writeFile(big, Buffer.concat([PNG_BYTES, Buffer.alloc(11 * 1024 * 1024)]))
     const attachments = new FakeAttachments()
     attachments.readImageBytes = PNG_BYTES
-    const { bridge, gateway } = setup({ attachments })
+    const { bridge, gateway } = setupInDir(dir, { attachments })
     await turnWithPresent(bridge, undefined, [{ path: big }])
     expect(attachments.saved).toHaveLength(1)
     expect(attachments.saved[0]?.mediaType).toBe('image/png')
@@ -217,7 +228,7 @@ describe('OmniBridge present deliverables', () => {
     await writeFile(file, PNG_BYTES)
     const attachments = new FakeAttachments()
     attachments.readImageBytes = PNG_BYTES
-    const { bridge, gateway } = setup({ attachments })
+    const { bridge, gateway } = setupInDir(dir, { attachments })
     // The direct upload exhausts its retry ladder, then the normalized retry wins.
     const rejected = (): Error => Object.assign(new Error('image too large'), { code: 234006 })
     gateway.imageUploadFailures.push(rejected(), rejected(), rejected())
@@ -233,7 +244,7 @@ describe('OmniBridge present deliverables', () => {
     await writeFile(file, PNG_BYTES)
     const attachments = new FakeAttachments()
     attachments.readImageFailures.push(new Error('store down'))
-    const { bridge, gateway } = setup({ attachments })
+    const { bridge, gateway } = setupInDir(dir, { attachments })
     for (let attempt = 0; attempt < 6; attempt += 1) gateway.imageUploadFailures.push(new Error('rejected'))
     await turnWithPresent(bridge, undefined, [{ path: file }])
     expect(gateway.images).toEqual([])
@@ -245,7 +256,7 @@ describe('OmniBridge present deliverables', () => {
     const dir = await tempDir()
     const file = join(dir, 'a.pdf')
     await writeFile(file, '%PDF')
-    const { bridge, gateway } = setup({ bindings: [alice, bob] })
+    const { bridge, gateway } = setupInDir(dir, { bindings: [alice, bob] })
     gateway.fileSendFailures.set('oc_bob', [Object.assign(new Error('bot removed'), { code: 230002 })])
     await turnWithPresent(bridge, undefined, [{ path: file }])
     expect(gateway.files.map(row => row.chatId)).toEqual(['oc_alice'])
@@ -269,7 +280,7 @@ describe('OmniBridge present deliverables', () => {
     const dir = await tempDir()
     const file = join(dir, 'a.pdf')
     await writeFile(file, '%PDF')
-    const { bridge, gateway } = setup()
+    const { bridge, gateway } = setupInDir(dir)
     await turnWithPresent(bridge, undefined, [{ path: file }, { path: file }])
     expect(gateway.uploadedFileRequests).toHaveLength(1)
     expect(gateway.files).toHaveLength(1)
@@ -282,7 +293,7 @@ describe('OmniBridge present deliverables', () => {
     await writeFile(longPdf, '%PDF')
     const makefile = join(dir, 'Makefile')
     await writeFile(makefile, 'all:')
-    const { bridge, gateway } = setup()
+    const { bridge, gateway } = setupInDir(dir)
     await turnWithPresent(bridge, undefined, [{ path: longPdf }, { path: makefile }])
     const names = gateway.uploadedFileRequests.map(row => row.name)
     expect(names[0]?.endsWith('.pdf')).toBe(true)
@@ -298,7 +309,7 @@ describe('OmniBridge present deliverables', () => {
     const second = join(dir, 'b.pdf')
     await writeFile(first, '%PDF-a')
     await writeFile(second, '%PDF-b')
-    const { bridge, gateway } = setup({ bindings: [alice, bob] })
+    const { bridge, gateway } = setupInDir(dir, { bindings: [alice, bob] })
     await bridge.sessionEvent(SESSION.sessionId, assistantEvent(1, 'done', 1))
     await bridge.sessionEvent(SESSION.sessionId, presentedEvent(2, 1, [{ path: first }]))
     await bridge.sessionEvent(SESSION.sessionId, presentedEvent(3, 1, [{ path: second }, { path: first }]))
@@ -312,7 +323,7 @@ describe('OmniBridge present deliverables', () => {
     const dir = await tempDir()
     const file = join(dir, 'a.pdf')
     await writeFile(file, '%PDF')
-    const { bridge, gateway } = setup()
+    const { bridge, gateway } = setupInDir(dir)
     gateway.fileSendFailures.set('oc_alice', [Object.assign(new Error('rate limited'), { code: 230020 })])
     await turnWithPresent(bridge, undefined, [{ path: file }])
     expect(gateway.fileAttempts).toHaveLength(2)
@@ -325,7 +336,7 @@ describe('OmniBridge present deliverables', () => {
     const dir = await tempDir()
     const file = join(dir, 'a.pdf')
     await writeFile(file, '%PDF')
-    const { bridge, gateway } = setup()
+    const { bridge, gateway } = setupInDir(dir)
     gateway.fileUploadFailures.push(Object.assign(new Error('rate limited'), { code: 230020 }))
     await turnWithPresent(bridge, undefined, [{ path: file }])
     expect(gateway.uploadedFileRequests).toHaveLength(2)
@@ -337,7 +348,7 @@ describe('OmniBridge present deliverables', () => {
     const dir = await tempDir()
     const file = join(dir, 'chart.png')
     await writeFile(file, PNG_BYTES)
-    const { bridge, gateway } = setup({ bindings: [alice, bob] })
+    const { bridge, gateway } = setupInDir(dir, { bindings: [alice, bob] })
     await turnWithPresent(bridge, undefined, [{ path: file }])
     expect(gateway.imageUploads).toHaveLength(1)
     expect(gateway.images.map(row => row.chatId)).toEqual(['oc_alice', 'oc_bob'])
@@ -348,7 +359,7 @@ describe('OmniBridge present deliverables', () => {
     const dir = await tempDir()
     const empty = join(dir, 'empty.txt')
     await writeFile(empty, '')
-    const { bridge, gateway } = setup()
+    const { bridge, gateway } = setupInDir(dir)
     await turnWithPresent(bridge, undefined, [{ path: empty }, { path: dir }])
     const notices = gateway.sent.map(row => row.text)
     expect(notices.some(text => text.includes('empty.txt') && text.includes('文件为空'))).toBe(true)
@@ -363,7 +374,7 @@ describe('OmniBridge present deliverables', () => {
       await writeFile(file, `file-${index}`)
       files.push({ path: file })
     }
-    const { bridge, gateway, logs } = setup()
+    const { bridge, gateway, logs } = setupInDir(dir)
     await turnWithPresent(bridge, undefined, files)
     expect(gateway.uploadedFileRequests).toHaveLength(32)
     expect(logs.some(log => log.level === 'warn' && log.message.includes('per-turn cap'))).toBe(true)
@@ -387,7 +398,7 @@ describe('OmniBridge present deliverables', () => {
     const file = join(dir, 'a.pdf')
     await writeFile(file, '%PDF')
     const longMarkdown = Array.from({ length: 700 }, (_, index) => `段落 ${index}：` + 'x'.repeat(60)).join('\n\n')
-    const { bridge, gateway } = setup()
+    const { bridge, gateway } = setupInDir(dir)
     const order: string[] = []
     const markdown = gateway.sendMarkdown.bind(gateway)
     gateway.sendMarkdown = async (...args) => {
@@ -409,7 +420,7 @@ describe('OmniBridge present deliverables', () => {
     const dir = await tempDir()
     const file = join(dir, 'a.pdf')
     await writeFile(file, '%PDF')
-    const { bridge, gateway } = setup()
+    const { bridge, gateway } = setupInDir(dir)
     let calls = 0
     gateway.sendFile = () => {
       calls += 1
@@ -428,11 +439,125 @@ describe('OmniBridge present deliverables', () => {
     const dir = await tempDir()
     const file = join(dir, 'a.pdf')
     await writeFile(file, '%PDF')
-    const { bridge, gateway } = setup({ bindings: [alice, bob] })
+    const { bridge, gateway } = setupInDir(dir, { bindings: [alice, bob] })
     await bridge.sessionEvent(SESSION.sessionId, userEvent(1, '[飞书 · Alice]\nhello', 'feishu-omni:om_1:oc_alice'))
     await turnWithPresent(bridge, 'done', [{ path: file }])
     expect(gateway.sent.map(row => row.chatId)).toEqual(['oc_bob'])
     expect(gateway.files.map(row => row.chatId)).toEqual(['oc_alice', 'oc_bob'])
+  })
+
+  describe('path containment', () => {
+    it('degrades an absolute file outside the workspace without leaking its path', async () => {
+      const workspace = await tempDir()
+      const outside = await tempDir()
+      const file = join(outside, 'secret.txt')
+      await writeFile(file, 'secret!')
+      const { bridge, gateway } = setupInDir(workspace)
+      await turnWithPresent(bridge, undefined, [{ path: file }])
+      expect(gateway.uploadedFileRequests).toEqual([])
+      expect(gateway.files).toEqual([])
+      const notices = gateway.sent.filter(row => row.text.includes('未发送'))
+      expect(notices).toHaveLength(1)
+      expect(notices[0]?.text).toContain('secret.txt')
+      expect(notices[0]?.text).toContain('不在会话工作区或 DSH 附件目录内')
+      expect(notices[0]?.text).toContain('7 B')
+      expect(notices[0]?.text).not.toContain(outside)
+    })
+
+    it('degrades a present path that escapes the workspace with ../', async () => {
+      const parent = await tempDir()
+      const workspace = join(parent, 'work')
+      await mkdir(workspace)
+      await writeFile(join(parent, 'secret.txt'), 'secret!')
+      const { bridge, gateway } = setupInDir(workspace)
+      await turnWithPresent(bridge, undefined, [{ path: '../secret.txt' }])
+      expect(gateway.uploadedFileRequests).toEqual([])
+      const notices = gateway.sent.filter(row => row.text.includes('未发送'))
+      expect(notices[0]?.text).toContain('不在会话工作区或 DSH 附件目录内')
+      expect(notices[0]?.text).not.toContain(parent)
+    })
+
+    it('does not follow a present symlink that points outside the workspace', async () => {
+      const workspace = await tempDir()
+      const outside = await tempDir()
+      const target = join(outside, 'secret.txt')
+      await writeFile(target, 'secret!')
+      await symlink(target, join(workspace, 'report.txt'))
+      const { bridge, gateway } = setupInDir(workspace)
+      await turnWithPresent(bridge, undefined, [{ path: 'report.txt' }])
+      expect(gateway.uploadedFileRequests).toEqual([])
+      const notices = gateway.sent.filter(row => row.text.includes('未发送'))
+      expect(notices[0]?.text).toContain('report.txt')
+      expect(notices[0]?.text).not.toContain(outside)
+    })
+
+    it('delivers a present symlink whose target is inside the workspace', async () => {
+      const workspace = await tempDir()
+      await writeFile(join(workspace, 'report.pdf'), '%PDF')
+      await symlink(join(workspace, 'report.pdf'), join(workspace, 'link.pdf'))
+      const { bridge, gateway } = setupInDir(workspace)
+      await turnWithPresent(bridge, undefined, [{ path: 'link.pdf' }])
+      expect(gateway.uploadedFileRequests).toHaveLength(1)
+      expect(gateway.files).toHaveLength(1)
+      expect(gateway.sent).toEqual([])
+    })
+
+    it('fails closed and keeps the workspace working when the attachment-root lookup throws', async () => {
+      const workspace = await tempDir()
+      const outside = await tempDir()
+      const secret = join(outside, 'secret.txt')
+      await writeFile(secret, 'secret!')
+      const good = join(workspace, 'good.txt')
+      await writeFile(good, 'hello')
+      const { bridge, gateway, logs } = setupInDir(workspace, {
+        attachmentRoots: () => { throw new Error('host adapter unavailable') },
+      })
+      await turnWithPresent(bridge, undefined, [{ path: secret }, { path: good }])
+      expect(gateway.uploadedFileRequests.map(row => row.name)).toEqual(['good.txt'])
+      const notices = gateway.sent.filter(row => row.text.includes('未发送'))
+      expect(notices[0]?.text).toContain('不在会话工作区或 DSH 附件目录内')
+      expect(logs.some(log => log.level === 'warn' && log.message.includes('attachment root lookup failed'))).toBe(true)
+    })
+
+    it('reports an unknown workspace root instead of claiming the file is outside it', async () => {
+      const file = join(await tempDir(), 'a.pdf')
+      await writeFile(file, '%PDF')
+      const unknownCwd = new FakeSessions([{ ...SESSION, cwd: null }])
+      const { bridge, gateway } = setup({ sessions: unknownCwd })
+      await turnWithPresent(bridge, undefined, [{ path: file }])
+      expect(gateway.uploadedFileRequests).toEqual([])
+      expect(gateway.sent[0]?.text).toContain('无法确定会话工作区或 DSH 附件目录')
+    })
+
+    it('delivers a present file inside the DSH attachment root', async () => {
+      const workspace = await tempDir()
+      const attachmentRoot = await tempDir()
+      const file = join(attachmentRoot, 'stored.pdf')
+      await writeFile(file, '%PDF')
+      const { bridge, gateway } = setupInDir(workspace, { attachmentRoots: () => [attachmentRoot] })
+      await turnWithPresent(bridge, undefined, [{ path: file }])
+      expect(gateway.uploadedFileRequests).toHaveLength(1)
+      expect(gateway.files).toHaveLength(1)
+      expect(gateway.sent).toEqual([])
+    })
+  })
+
+  it('ignores a present event that arrives after its turn already ended', async () => {
+    const dir = await tempDir()
+    const file = join(dir, 'late.pdf')
+    await writeFile(file, '%PDF')
+    const { bridge, gateway, logs } = setupInDir(dir)
+    await bridge.sessionEvent(SESSION.sessionId, assistantEvent(1, 'done', 1))
+    await bridge.sessionEvent(SESSION.sessionId, turnEnd(2, 1))
+    // A delayed/replayed present event for the ended turn must not be buffered.
+    await bridge.sessionEvent(SESSION.sessionId, presentedEvent(3, 1, [{ path: file }]))
+    await bridge.sessionEvent(SESSION.sessionId, assistantEvent(4, 'next', 2))
+    await bridge.sessionEvent(SESSION.sessionId, turnEnd(5, 2))
+    await bridge.drain()
+    expect(gateway.uploadedFileRequests).toEqual([])
+    expect(gateway.files).toEqual([])
+    expect(gateway.cards.map(row => row.markdown)).toEqual(['done', 'next'])
+    expect(logs.some(log => log.level === 'warn' && log.message.includes('after its turn ended'))).toBe(true)
   })
 })
 
@@ -581,5 +706,138 @@ describe('OmniBridge inline card images', () => {
     await turnWithPresent(bridge, '![a](chart.png) and ![b](<chart.png>)', [])
     expect(gateway.imageUploads).toHaveLength(1)
     expect(gateway.cards[0]?.markdown).toBe('![a](img_key_1) and ![b](img_key_1)')
+  })
+
+  describe('path containment', () => {
+    it('does not upload or rewrite an image outside the workspace', async () => {
+      const workspace = await tempDir()
+      const outside = await tempDir()
+      const file = join(outside, 'chart.png')
+      await writeFile(file, PNG_BYTES)
+      const markdown = `结果：![图](<${file}>)`
+      const { bridge, gateway } = setupInDir(workspace)
+      await turnWithPresent(bridge, markdown, [])
+      expect(gateway.imageUploads).toEqual([])
+      expect(gateway.cards[0]?.markdown).toBe(markdown)
+    })
+
+    it('does not upload or rewrite an image reached through ../', async () => {
+      const parent = await tempDir()
+      const workspace = join(parent, 'work')
+      await mkdir(workspace)
+      await writeFile(join(parent, 'chart.png'), PNG_BYTES)
+      const markdown = '结果：![图](../chart.png)'
+      const { bridge, gateway } = setupInDir(workspace)
+      await turnWithPresent(bridge, markdown, [])
+      expect(gateway.imageUploads).toEqual([])
+      expect(gateway.cards[0]?.markdown).toBe(markdown)
+    })
+
+    it('does not follow an inline symlink that points outside the workspace', async () => {
+      const workspace = await tempDir()
+      const outside = await tempDir()
+      await writeFile(join(outside, 'chart.png'), PNG_BYTES)
+      await symlink(join(outside, 'chart.png'), join(workspace, 'link.png'))
+      const markdown = '结果：![图](link.png)'
+      const { bridge, gateway } = setupInDir(workspace)
+      await turnWithPresent(bridge, markdown, [])
+      expect(gateway.imageUploads).toEqual([])
+      expect(gateway.cards[0]?.markdown).toBe(markdown)
+    })
+
+    it('rewrites an inline symlink whose target is inside the workspace', async () => {
+      const workspace = await tempDir()
+      await writeFile(join(workspace, 'real.png'), PNG_BYTES)
+      await symlink(join(workspace, 'real.png'), join(workspace, 'link.png'))
+      const { bridge, gateway } = setupInDir(workspace)
+      await turnWithPresent(bridge, '结果：![图](link.png)', [])
+      expect(gateway.imageUploads).toHaveLength(1)
+      expect(gateway.cards[0]?.markdown).toBe('结果：![图](img_key_1)')
+    })
+
+    it('rewrites an image inside the DSH attachment root', async () => {
+      const workspace = await tempDir()
+      const attachmentRoot = await tempDir()
+      const file = join(attachmentRoot, 'stored.png')
+      await writeFile(file, PNG_BYTES)
+      const { bridge, gateway } = setupInDir(workspace, { attachmentRoots: () => [attachmentRoot] })
+      await turnWithPresent(bridge, `结果：![图](<${file}>)`, [])
+      expect(gateway.imageUploads).toHaveLength(1)
+      expect(gateway.cards[0]?.markdown).toBe('结果：![图](img_key_1)')
+    })
+  })
+
+  it('does not rewrite image syntax inside a four-space indented code block', async () => {
+    const dir = await tempDir()
+    await writeFile(join(dir, 'chart.png'), PNG_BYTES)
+    const { bridge, gateway } = setupInDir(dir)
+    // The assistant text accessor trims the very start of the reply, so keep the
+    // indented block after a paragraph exactly as a real reply would.
+    const markdown = ['说明：', '', '    ![code](chart.png)', '', '![real](chart.png)'].join('\n')
+    await turnWithPresent(bridge, markdown, [])
+    expect(gateway.cards[0]?.markdown)
+      .toBe(['说明：', '', '    ![code](chart.png)', '', '![real](img_key_1)'].join('\n'))
+    expect(gateway.imageUploads).toHaveLength(1)
+  })
+
+  it('does not rewrite image syntax inside a tab-indented code block', async () => {
+    const dir = await tempDir()
+    await writeFile(join(dir, 'chart.png'), PNG_BYTES)
+    const { bridge, gateway } = setupInDir(dir)
+    const markdown = ['说明：', '', '\t![code](chart.png)', '', '![real](chart.png)'].join('\n')
+    await turnWithPresent(bridge, markdown, [])
+    expect(gateway.cards[0]?.markdown)
+      .toBe(['说明：', '', '\t![code](chart.png)', '', '![real](img_key_1)'].join('\n'))
+    expect(gateway.imageUploads).toHaveLength(1)
+  })
+
+  it('does not rewrite indented code inside blockquote or list containers', async () => {
+    const dir = await tempDir()
+    await writeFile(join(dir, 'chart.png'), PNG_BYTES)
+    const { bridge, gateway } = setupInDir(dir)
+    // `>     ` and `-     ` are blockquote/list containers whose content is a
+    // CommonMark indented code block; `   \tab` reaches column 4 through the tab
+    // stop. All three must stay literal examples.
+    const lines = [
+      '说明：',
+      '',
+      '>     ![quote](chart.png)',
+      '',
+      '-     ![list](chart.png)',
+      '',
+      '- >     ![list-quote](chart.png)',
+      '',
+      '- -     ![list-list](chart.png)',
+      '',
+      '   \t![tab](chart.png)',
+      '',
+      '![real](chart.png)',
+    ]
+    await turnWithPresent(bridge, lines.join('\n'), [])
+    const expected = [...lines]
+    expected[expected.length - 1] = '![real](img_key_1)'
+    expect(gateway.cards[0]?.markdown).toBe(expected.join('\n'))
+    expect(gateway.imageUploads).toHaveLength(1)
+  })
+
+  it('rewrites an image preceded by an even number of backslashes', async () => {
+    const dir = await tempDir()
+    await writeFile(join(dir, 'chart.png'), PNG_BYTES)
+    const { bridge, gateway } = setupInDir(dir)
+    // Two backslashes are an escaped backslash, so the image itself is active.
+    const markdown = String.raw`路径 \\![x](chart.png)`
+    await turnWithPresent(bridge, markdown, [])
+    expect(gateway.cards[0]?.markdown).toBe(String.raw`路径 \\![x](img_key_1)`)
+    expect(gateway.imageUploads).toHaveLength(1)
+  })
+
+  it('does not rewrite a backslash-escaped image reference', async () => {
+    const dir = await tempDir()
+    await writeFile(join(dir, 'chart.png'), PNG_BYTES)
+    const { bridge, gateway } = setupInDir(dir)
+    const markdown = '字面量 \\![x](chart.png) 与真图 ![y](chart.png)'
+    await turnWithPresent(bridge, markdown, [])
+    expect(gateway.cards[0]?.markdown).toBe('字面量 \\![x](chart.png) 与真图 ![y](img_key_1)')
+    expect(gateway.imageUploads).toHaveLength(1)
   })
 })

@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import {
-  deliveryFailureKind, isRetryable, isRetryableDelivery, reactionFailureDetail, reactionFailureKind, safeMessage,
+  attachmentErrorClass, attachmentErrorCode, deliveryFailureKind, isRetryable, isRetryableDelivery,
+  reactionFailureDetail, reactionFailureKind, safeMessage,
 } from '../src/errors.ts'
+import { attachmentError } from './helpers.ts'
 
 describe('error safety and retry policy', () => {
   it('redacts known secrets and token-shaped response fields', () => {
@@ -71,6 +73,40 @@ describe('error safety and retry policy', () => {
     expect(reactionFailureKind({ response: { status: 500 } })).toBe('other')
     expect(reactionFailureKind({ code: 231003 })).toBe('other')
     expect(reactionFailureKind(new Error('message was recalled'))).toBe('other')
+  })
+})
+
+describe('DSH AttachmentError classification', () => {
+  it('identifies stable attachment codes structurally, across package copies', () => {
+    expect(attachmentErrorCode(attachmentError('IMAGE_TOO_MANY_PIXELS'))).toBe('IMAGE_TOO_MANY_PIXELS')
+    // A structural object is enough: no instanceof against a duplicate package.
+    expect(attachmentErrorCode({ name: 'AttachmentError', code: 'UNSUPPORTED_IMAGE_TYPE' }))
+      .toBe('UNSUPPORTED_IMAGE_TYPE')
+    // Wrapped causes are followed, because callers may re-wrap the failure.
+    expect(attachmentErrorCode(new Error('gateway/internal', { cause: attachmentError('ATTACHMENT_WRITE_FAILED') })))
+      .toBe('ATTACHMENT_WRITE_FAILED')
+    // Foreign codes, plain errors and DSH RemoteErrors are never misclassified.
+    expect(attachmentErrorCode(new Error('plain'))).toBeUndefined()
+    expect(attachmentErrorCode(Object.assign(new Error('fs'), { code: 'ENOENT' }))).toBeUndefined()
+    expect(attachmentErrorCode({
+      isDSHRemoteError: true, code: 'session/attachment-invalid', details: { reason: 'IMAGE_TOO_LARGE' },
+    })).toBeUndefined()
+  })
+
+  it('maps image admission codes to the specific degradation classes', () => {
+    expect(attachmentErrorClass('IMAGE_TOO_LARGE')).toBe('image-bytes')
+    expect(attachmentErrorClass('IMAGES_TOO_LARGE')).toBe('image-bytes')
+    expect(attachmentErrorClass('IMAGE_TOO_MANY_PIXELS')).toBe('image-pixels')
+    expect(attachmentErrorClass('IMAGE_DIMENSION_TOO_LARGE')).toBe('image-pixels')
+    expect(attachmentErrorClass('UNSUPPORTED_IMAGE_TYPE')).toBe('unsupported-image')
+    // Corrupt/type-mismatched payloads are not a format-compatibility problem.
+    expect(attachmentErrorClass('INVALID_IMAGE')).toBe('invalid-image')
+    expect(attachmentErrorClass('INVALID_IMAGE_BASE64')).toBe('invalid-image')
+    expect(attachmentErrorClass('IMAGE_TYPE_MISMATCH')).toBe('invalid-image')
+    expect(attachmentErrorClass('TOO_MANY_IMAGES')).toBe('too-many-images')
+    // Storage faults keep the generic "attachment service failed" notice.
+    expect(attachmentErrorClass('ATTACHMENT_WRITE_FAILED')).toBeUndefined()
+    expect(attachmentErrorClass('ATTACHMENT_FILES_UNSUPPORTED')).toBeUndefined()
   })
 })
 

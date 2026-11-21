@@ -42,6 +42,19 @@ function optionalService<T>(ctx: Context, name: string): T | undefined {
   }
 }
 
+/**
+ * Absolute host path of the mounted attachment store, when it exposes one.
+ * The local attachment backend publishes `root` (`$DSH_HOME/attachments/v1`);
+ * the outbound upload containment check allows files inside it so an agent can
+ * hand back a file it received as an inbound attachment. Resolved at call time
+ * so a provider reload cannot leave a stale path.
+ */
+export function dshAttachmentRoot(ctx: Context): string | undefined {
+  const service = optionalService<{ readonly root?: unknown }>(ctx, 'attachments')
+  const root = service?.root
+  return typeof root === 'string' && root.trim().length > 0 ? root : undefined
+}
+
 export class DshCredentialPort implements CredentialPort {
   private readonly ref = credentialRef(CREDENTIAL_REF)
 
