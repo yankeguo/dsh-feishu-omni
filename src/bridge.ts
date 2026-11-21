@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto'
 import { assistantCardTitle, assistantFallbackText, splitAssistantMarkdown } from './card.ts'
 import {
-  deliveryFailureKind, isRetryable, isRetryableDelivery, reactionFailureKind, safeMessage, silentLogger,
-  type Logger, type ReactionFailureKind,
+  deliveryFailureKind, isRetryable, isRetryableDelivery, reactionFailureDetail, reactionFailureKind,
+  silentLogger, type Logger, type ReactionFailureKind,
 } from './errors.ts'
 import { extractInboundMessage, type FeishuMessageEvent } from './events.ts'
 import type { TestResult } from './public.ts'
@@ -215,6 +215,8 @@ export class OmniBridge {
    * (missing scope, rate limit, recalled message, network) must not affect
    * prompt admission or broadcast. The warning is logged once per failure kind
    * state change so a missing permission cannot flood the Host log per message.
+   * Each warning carries a sanitized `code=/status=/msg=` detail: the bare axios
+   * message cannot tell a recalled message from an out-of-range user.
    */
   private async acknowledge(messageId: string): Promise<void> {
     try {
@@ -234,22 +236,23 @@ export class OmniBridge {
       const kind = reactionFailureKind(error)
       if (kind === this.reactionFailure) return
       this.reactionFailure = kind
+      const detail = reactionFailureDetail(error)
       if (kind === 'permission') {
         this.logger.warn(
           'Feishu reaction ack failed: the app lacks the im:message.reactions:write_only '
           + '(or im:message) scope; grant it in the Feishu developer console and publish a new app version '
-          + `(${safeMessage(error)})`,
+          + `(${detail})`,
         )
         return
       }
       if (kind === 'rate-limit') {
         this.logger.warn(
           'Feishu reaction ack failed (rate-limit; the API allows 1000 reactions/min and 50/s): '
-          + safeMessage(error),
+          + detail,
         )
         return
       }
-      this.logger.warn(`Feishu reaction ack failed (other): ${safeMessage(error)}`)
+      this.logger.warn(`Feishu reaction ack failed (other): ${detail}`)
     }
   }
 

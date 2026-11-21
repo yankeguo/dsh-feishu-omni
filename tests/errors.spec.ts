@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
-  deliveryFailureKind, isRetryable, isRetryableDelivery, reactionFailureKind, safeMessage,
+  deliveryFailureKind, isRetryable, isRetryableDelivery, reactionFailureDetail, reactionFailureKind, safeMessage,
 } from '../src/errors.ts'
 
 describe('error safety and retry policy', () => {
@@ -71,5 +71,64 @@ describe('error safety and retry policy', () => {
     expect(reactionFailureKind({ response: { status: 500 } })).toBe('other')
     expect(reactionFailureKind({ code: 231003 })).toBe('other')
     expect(reactionFailureKind(new Error('message was recalled'))).toBe('other')
+  })
+})
+
+describe('reaction failure detail', () => {
+  it('extracts the business code, HTTP status and provider msg from an axios-style error', () => {
+    const error = Object.assign(new Error('Request failed with status code 400'), {
+      code: 'ERR_BAD_REQUEST',
+      config: {
+        url: 'https://open.feishu.cn/open-apis/im/v1/messages/om_1/reactions?app_secret=secret-fixture',
+        data: '{"reaction_type":{"emoji_type":"OK"}}',
+        headers: { Authorization: 'Bearer token-fixture' },
+      },
+      response: {
+        status: 400,
+        data: {
+          code: 231022,
+          // The provider echoes credential-shaped text: it must be redacted too.
+          msg: '用户不在应用机器人的可用范围 app_secret=secret-fixture',
+          error: { permission_violations: [] },
+        },
+      },
+    })
+    const detail = reactionFailureDetail(error)
+    expect(detail).toBe('code=231022 status=400 msg=用户不在应用机器人的可用范围 app_secret=[redacted]')
+    // Request body, credentials, headers, URLs and the raw envelope never leak.
+    expect(detail).not.toContain('secret-fixture')
+    expect(detail).not.toContain('token-fixture')
+    expect(detail).not.toContain('reaction_type')
+    expect(detail).not.toContain('https://')
+    expect(detail).not.toContain('permission_violations')
+  })
+
+  it('degrades to the error message for pure network failures without response metadata', () => {
+    expect(reactionFailureDetail(new Error('socket reset'))).toBe('msg=socket reset')
+    const timeout = Object.assign(new Error('timeout of 15000ms exceeded'), { code: 'ECONNABORTED' })
+    expect(reactionFailureDetail(timeout)).toBe('msg=timeout of 15000ms exceeded')
+    expect(reactionFailureDetail(new Error('socket reset'))).not.toContain('code=')
+    expect(reactionFailureDetail(new Error('socket reset'))).not.toContain('status=')
+  })
+
+  it('flattens and truncates long provider messages', () => {
+    const detail = reactionFailureDetail({
+      response: { status: 400, data: { code: 231002, msg: `第一行\n第二行\t${'很长的内容'.repeat(80)}` } },
+    })
+    expect(detail).toContain('code=231002 status=400 msg=第一行 第二行 ')
+    expect(detail).not.toMatch(/[\r\n\t]/)
+    // "code=231002 status=400 msg=" is 27 chars; the bounded msg adds at most 200.
+    expect(detail.length).toBe(227)
+    expect(detail.endsWith('…')).toBe(true)
+  })
+
+  it('ignores non-string provider messages instead of stringifying a payload', () => {
+    const detail = reactionFailureDetail({
+      code: 231003,
+      response: { status: 400, data: { code: 231003, msg: { text: 'payload-secret' } } },
+    })
+    expect(detail).toBe('code=231003 status=400 msg=unknown error')
+    expect(detail).not.toContain('payload-secret')
+    expect(detail).not.toContain('[object')
   })
 })

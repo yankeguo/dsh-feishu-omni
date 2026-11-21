@@ -8,13 +8,18 @@ export interface Logger {
 
 export const silentLogger: Logger = { info() {}, warn() {}, error() {} }
 
+/** Redact credential-shaped material such as `app_secret=...` or token fields. */
+function redactCredentialMaterial(message: string): string {
+  return message.replace(/(app_secret|appSecret|tenant_access_token)["'\s:=]+[^\s,"'}]+/gi, '$1=[redacted]')
+}
+
 /** Keep only a bounded message and explicitly redact known credential material. */
 export function safeMessage(error: unknown, secrets: readonly string[] = []): string {
   let message = error instanceof Error ? error.message : String(error)
   for (const secret of secrets) {
     if (secret) message = message.replaceAll(secret, '[redacted]')
   }
-  message = message.replace(/(app_secret|appSecret|tenant_access_token)["'\s:=]+[^\s,"'}]+/gi, '$1=[redacted]')
+  message = redactCredentialMaterial(message)
   if (!message.trim()) return 'Unknown error'
   return message.length > 500 ? `${message.slice(0, 497)}…` : message
 }
@@ -173,4 +178,70 @@ export function reactionFailureKind(error: unknown): ReactionFailureKind {
   if (code !== undefined && RETRYABLE_PROVIDER_CODES.has(code)) return 'rate-limit'
   if (httpStatusOf(error) === 429) return 'rate-limit'
   return 'other'
+}
+
+/** Longest provider message kept in a failure detail; longer text is ellipsized. */
+const FAILURE_DETAIL_MESSAGE_MAX = 200
+
+function recordOf(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : undefined
+}
+
+/**
+ * First provider-supplied `msg` reachable from the usual error shapes. Axios
+ * keeps the Feishu envelope at `response.data`, while a raw SDK response or a
+ * hand-built `Object.assign` error may carry it at `data`/`msg` instead.
+ * Non-string values are ignored rather than stringified: there the value would
+ * be a structured payload, and payloads must never reach the Host log.
+ */
+function providerFailureMessage(error: unknown): string | undefined {
+  const record = recordOf(error)
+  if (record === undefined) return undefined
+  const data = recordOf(recordOf(record.response)?.data)
+  for (const value of [data?.msg, recordOf(record.data)?.msg, record.msg]) {
+    if (typeof value === 'string' && value.trim()) return value
+  }
+  return undefined
+}
+
+/** Scalar fallback message for errors that carry no Feishu envelope. */
+function fallbackFailureMessage(error: unknown): string | undefined {
+  if (error instanceof Error || typeof error === 'string') return safeMessage(error)
+  const message = recordOf(error)?.message
+  return typeof message === 'string' && message.trim() ? message : undefined
+}
+
+/** Flatten control characters, redact credential material, and bound the length. */
+function sanitizeFailureDetailMessage(message: string): string {
+  const flattened = redactCredentialMaterial(message)
+    .replace(/\p{Cc}+/gu, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+  return flattened.length > FAILURE_DETAIL_MESSAGE_MAX
+    ? `${flattened.slice(0, FAILURE_DETAIL_MESSAGE_MAX - 1)}…`
+    : flattened
+}
+
+/**
+ * Build a one-line, sanitized summary of a failed reaction call for logs:
+ * `code=<business code> status=<HTTP status> msg=<provider msg>`, with absent
+ * parts omitted. A bare axios `Request failed with status code 400` cannot tell
+ * a recalled message (`231003`) from an out-of-range user (`231022`); the
+ * business code and Feishu `msg` can.
+ *
+ * Only scalar fields of the error/response envelope are read. Request bodies,
+ * message text, URLs with query strings, credentials and raw error objects never
+ * appear: the provider `msg` is redacted and flattened, and the fallback message
+ * is bounded and credential-redacted too.
+ */
+export function reactionFailureDetail(error: unknown): string {
+  const parts: string[] = []
+  const code = providerCode(error)
+  if (code !== undefined) parts.push(`code=${code}`)
+  const status = httpStatusOf(error)
+  if (status !== undefined) parts.push(`status=${status}`)
+  const rawMessage = providerFailureMessage(error) ?? fallbackFailureMessage(error)
+  const message = rawMessage === undefined ? '' : sanitizeFailureDetailMessage(rawMessage)
+  parts.push(`msg=${message || 'unknown error'}`)
+  return parts.join(' ')
 }

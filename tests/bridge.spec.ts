@@ -393,6 +393,7 @@ describe('OmniBridge reaction ack', () => {
     const warnings = logs.filter(log => log.level === 'warn')
     expect(warnings).toHaveLength(1)
     expect(warnings[0]?.message).toContain('im:message.reactions:write_only')
+    expect(warnings[0]?.message).toContain('code=99991672')
     await bridge.sessionEvent(SESSION.sessionId, userEvent(1, '[飞书 · Alice]\nhello', 'feishu-omni:om_1:oc_alice'))
     await bridge.drain()
     expect(gateway.sent.map(row => row.chatId)).toEqual(['oc_bob'])
@@ -459,8 +460,35 @@ describe('OmniBridge reaction ack', () => {
     const warnings = logs.filter(log => log.level === 'warn')
     expect(warnings).toHaveLength(2)
     expect(warnings[0]?.message).toContain('im:message.reactions:write_only')
+    expect(warnings[0]?.message).toContain('code=99991672')
     expect(warnings[1]?.message).toContain('rate-limit')
     expect(warnings[1]?.message).toContain('1000 reactions/min')
+    expect(warnings[1]?.message).toContain('code=99991400')
+  })
+
+  it('logs the Feishu business code and msg for an unclassified ack failure without leaking the payload', async () => {
+    const { bridge, gateway, logs } = setup()
+    gateway.reactionFailures.push(Object.assign(new Error('Request failed with status code 400'), {
+      code: 'ERR_BAD_REQUEST',
+      config: {
+        data: '{"reaction_type":{"emoji_type":"OK"}}',
+        headers: { Authorization: 'Bearer token-fixture' },
+      },
+      response: {
+        status: 400,
+        data: { code: 231022, msg: '用户不在应用机器人的可用范围' },
+      },
+    }))
+    await bridge.receive(feishuEvent())
+    await bridge.drain()
+    const warnings = logs.filter(log => log.level === 'warn')
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]?.message).toContain('Feishu reaction ack failed (other)')
+    // A recalled message (231003) and an out-of-range user (231022) both used to
+    // surface as the same bare axios status message; the detail tells them apart.
+    expect(warnings[0]?.message).toContain('code=231022 status=400 msg=用户不在应用机器人的可用范围')
+    expect(warnings[0]?.message).not.toContain('reaction_type')
+    expect(warnings[0]?.message).not.toContain('token-fixture')
   })
 
   it('cancels a stalled acknowledgement when the bridge stops', async () => {

@@ -139,7 +139,7 @@ pnpm run verify
 - **时机**：仅在 prompt admission 成功、且去重键已持久化之后，对原始 `message_id` 调用[添加消息表情回复](https://open.feishu.cn/document/server-docs/im-v1/message-reaction/create)（`POST /open-apis/im/v1/messages/:message_id/reactions`，body `{"reaction_type":{"emoji_type":"OK"}}`）。
 - **一次尝试、不重试**：5 秒有界超时并随 bridge 生命周期取消；任何失败只记日志，绝不影响消息投递与广播。
 - **不会加表情**：事件被忽略（群聊/机器人/不支持的消息类型/空文本）、`message_id` 或 `event_id` 去重命中（重复投递）、prompt 最终投递失败（此时仍保留原有的「消息暂时无法投递」提示）。
-- **失败表现**：缺权限、限频、消息已撤回、系统消息、网络/超时等只写日志，并在**首次出现或错误类别变化**时记一条 warning、恢复后记一条 info（避免每条消息刷屏）。ack 失败不写入 Settings 的连接状态/最近错误，不会被误报成连接故障。
+- **失败表现**：缺权限、限频、消息已撤回、系统消息、网络/超时等只写日志，并在**首次出现或错误类别变化**时记一条 warning、恢复后记一条 info（避免每条消息刷屏）。warning 附带脱敏后的摘要 `code=<飞书业务码> status=<HTTP status> msg=<飞书 msg>`（如 `code=231022 status=400 msg=...`，缺失项省略），因此撤回消息（`231003`）与用户不在可用范围（`231022`）等同类失败可以从日志区分；摘要不含请求体、消息正文、URL 查询参数或凭据。ack 失败不写入 Settings 的连接状态/最近错误，不会被误报成连接故障。
 - **平台限制**（官方文档）：消息已撤回后无法添加表情回复；系统消息（`system`）无法添加；接口频率限制为 1000 次/分钟、50 次/秒。
 - **所需权限**：`im:message.reactions:write_only`，或更宽的 `im:message`。新增权限后必须在飞书开放平台**发布新应用版本**才生效；未添加时消息流完全正常，只是没有 `OK` 回执，日志出现可辨识的权限警告。
 
