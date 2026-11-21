@@ -108,7 +108,7 @@ pnpm run verify
 
 ## 持久化与隐私
 
-- 非秘密配置、绑定和最近去重键：`$DSH_HOME/integrations/dsh-feishu-omni/state.json`（未设置 `DSH_HOME` 时为 `~/.dsh/...`）。写入采用临时文件原子替换，文件权限 `0600`。若该文件损坏，插件会把原文件改名为旁边的 `state.json.corrupt-*`，以空状态启动，并在设置页的最近错误中显示恢复信息；原文件不会直接删除。
+- 非秘密配置、绑定和最近去重键：`$DSH_HOME/integrations/dsh-feishu-omni/state.json`（未设置 `DSH_HOME` 时为 `~/.dsh/...`）。写入采用临时文件原子替换，文件权限 `0600`。读取时只把**内容损坏**（JSON 解析失败，或 schema/版本/绑定校验失败）的 `state.json` 改名为旁边的 `state.json.corrupt-*`，以空状态启动，设置页的最近错误会显示恢复信息，原文件不会直接删除。其它读 I/O 错误（如权限不足 EACCES）、非普通文件、超过 1 MiB 的文件不会被旁置或覆盖：插件初始化直接报错，文件保持原样，需要人工检查；旁置本身失败也按错误上抛，不会以空状态继续。
 - App Secret：DSH credentials 引用 `DSH_FEISHU_OMNI_APP_SECRET`，由本机 DSH credential provider 保存。
 - 管理 RPC 复用 DSH 已认证的 `/api` 通道，不新增端口，不读取或重写 profile 的 `cordis.patch.yml`。
 - 仓库、测试夹具、状态响应和插件日志均不应包含真实 Secret。

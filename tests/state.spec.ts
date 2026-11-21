@@ -1,13 +1,18 @@
-import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import { emptyState, FileStateStore, MemoryStateStore, normalizeState } from '../src/state.ts'
+import {
+  emptyState, FileStateStore, MemoryStateStore, normalizeState, StateFileError, StateRecoveryError,
+} from '../src/state.ts'
 
 const directories: string[] = []
 afterEach(async () => {
   await Promise.all(directories.splice(0).map(path => rm(path, { recursive: true, force: true })))
 })
+
+/** Permission-bit assertions are unreliable when the test runs as root. */
+const runningAsRoot = process.getuid?.() === 0
 
 describe('state persistence', () => {
   it('round-trips non-secret configuration and bindings with a private file mode', async () => {
@@ -63,6 +68,91 @@ describe('state persistence', () => {
     expect(await readFile(join(directory, files[0] ?? ''), 'utf8')).toBe('{bad json')
     await store.update(current => ({ ...current, sessionId: 'session-shared' }))
     expect(JSON.parse(await readFile(path, 'utf8'))).toMatchObject({ sessionId: 'session-shared' })
+  })
+
+  it('quarantines a structurally invalid state document as corruption', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'dfo-invalid-schema-'))
+    directories.push(directory)
+    const path = join(directory, 'state.json')
+    const document = `${JSON.stringify({ version: 2, sessionId: 'session-shared' })}\n`
+    await writeFile(path, document)
+    const store = new FileStateStore(path)
+    await expect(store.load()).rejects.toBeInstanceOf(StateRecoveryError)
+    expect(store.snapshot()).toEqual(emptyState())
+    const files = await readdir(directory)
+    expect(files).toHaveLength(1)
+    expect(files[0]).toMatch(/^state\.json\.corrupt-/)
+    expect(await readFile(join(directory, files[0] ?? ''), 'utf8')).toBe(document)
+    await store.update(current => ({ ...current, sessionId: 'session-shared' }))
+    expect(JSON.parse(await readFile(path, 'utf8'))).toMatchObject({ sessionId: 'session-shared' })
+  })
+
+  it.skipIf(runningAsRoot)('propagates read I/O errors without quarantining the state file', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'dfo-io-error-'))
+    directories.push(directory)
+    const path = join(directory, 'state.json')
+    const document = `${JSON.stringify(emptyState(), null, 2)}\n`
+    await writeFile(path, document)
+    await chmod(path, 0o000)
+    try {
+      const store = new FileStateStore(path)
+      // EACCES is an I/O problem, not corruption: the file must stay in place.
+      await expect(store.load()).rejects.toMatchObject({ code: 'EACCES' })
+      expect(() => store.snapshot()).toThrow(/has not been loaded/)
+      expect(await readdir(directory)).toEqual(['state.json'])
+      // A later update must retry the real read instead of continuing empty.
+      await expect(store.update(current => current)).rejects.toMatchObject({ code: 'EACCES' })
+    } finally {
+      await chmod(path, 0o600)
+    }
+    expect(await readFile(path, 'utf8')).toBe(document)
+  })
+
+  it('rejects an oversized state file without quarantining it', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'dfo-oversized-'))
+    directories.push(directory)
+    const path = join(directory, 'state.json')
+    const document = `${JSON.stringify({ version: 1, padding: 'x'.repeat(1024 * 1024) })}\n`
+    await writeFile(path, document)
+    const store = new FileStateStore(path)
+    const error = await store.load().catch((reason: unknown) => reason)
+    expect(error).toBeInstanceOf(StateFileError)
+    expect((error as Error).message).toMatch(/too large/)
+    expect(() => store.snapshot()).toThrow(/has not been loaded/)
+    expect(await readdir(directory)).toEqual(['state.json'])
+    expect(await readFile(path, 'utf8')).toBe(document)
+  })
+
+  it('rejects a non-regular state path without touching it', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'dfo-state-directory-'))
+    directories.push(directory)
+    const path = join(directory, 'state.json')
+    await mkdir(path)
+    const store = new FileStateStore(path)
+    await expect(store.load()).rejects.toBeInstanceOf(StateFileError)
+    expect(await readdir(directory)).toEqual(['state.json'])
+    expect((await stat(path)).isDirectory()).toBe(true)
+  })
+
+  it.skipIf(runningAsRoot)('propagates a quarantine rename failure instead of starting empty', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'dfo-quarantine-failure-'))
+    directories.push(directory)
+    const path = join(directory, 'state.json')
+    await writeFile(path, '{bad json')
+    // Removing write permission on the directory makes the quarantine rename fail.
+    await chmod(directory, 0o500)
+    try {
+      const store = new FileStateStore(path)
+      const error = await store.load().catch((reason: unknown) => reason)
+      expect(error).toBeInstanceOf(StateFileError)
+      expect((error as Error).message).toMatch(/could not be moved/)
+      expect((error as Error).cause).toMatchObject({ code: 'EACCES' })
+      expect(() => store.snapshot()).toThrow(/has not been loaded/)
+      expect(await readdir(directory)).toEqual(['state.json'])
+    } finally {
+      await chmod(directory, 0o700)
+    }
+    expect(await readFile(path, 'utf8')).toBe('{bad json')
   })
 
   it('never requires or serializes a credential field', async () => {

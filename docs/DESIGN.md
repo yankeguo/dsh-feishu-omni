@@ -88,7 +88,16 @@ MVP 镜像：所有直接人类输入（飞书与 DSH Web）和 lead 的最终�
 
 `state.json` 只包含版本、App ID、Session ID、autoConnect、绑定和去重键。写入流程为：读取并校验 → 串行更新 → 同目录临时文件（0600）→ fsync → rename。
 
-点击“连接”时先持久化 `autoConnect=true`，而不是等待异步 WebSocket `onReady`：即使本次连接失败，下次启动也会重试；“断开”才清除该标记。若读取时发现 JSON、schema、版本或绑定损坏，原文件会改名为同目录的 `state.json.corrupt-*`，Store 以空状态就绪，控制器继续初始化并把 `StateRecoveryError` 脱敏呈现在 `lastError`。只有完成旁置的恢复错误会被初始化吞掉；其它 I/O 错误仍向上抛出。
+点击“连接”时先持久化 `autoConnect=true`，而不是等待异步 WebSocket `onReady`：即使本次连接失败，下次启动也会重试；“断开”才清除该标记。
+
+读取失败按原因分流，只有真正的**内容损坏**才会旁置：
+
+- 文件不存在（ENOENT）：按首次运行处理，空状态就绪，不创建文件。
+- JSON 解析失败，或 `normalizeState` 校验失败（schema、version、binding 等）：原文件改名为同目录的 `state.json.corrupt-*`，Store 以空状态就绪，控制器继续初始化并把 `StateRecoveryError` 脱敏呈现在 `lastError`，原文件不会删除。旁置本身的 `rename` 失败时抛 `StateFileError`，原文件保持原位、Store 不就绪，不会以空状态继续。
+- `stat`/`readFile` 的 EACCES、EMFILE、EIO 等 I/O 错误：原样向上抛出，不改名、不吞掉、不以空状态继续；Host 初始化失败，原文件保持原样，修复权限/资源后可重试。
+- 路径存在但不是普通文件，或文件超过 1 MiB 上限：抛 `StateFileError`（消息含路径、实际大小与上限），不旁置、不覆盖，Host 初始化失败。超大文件可能是旧版本或用户手写的合法配置，因此不做自动处置，需人工检查后修复或删除。
+
+只有完成旁置的 `StateRecoveryError` 会被控制器初始化吞掉；其它错误一律向上抛出。
 
 App Secret 仅存在于单次浏览器请求、Host 内存与 DSH credentials。控制器额外用当前 Secret 替换第三方错误消息中的出现次数；Client 保存成功立即清空输入，状态解析器没有 Secret 字段。测试包含 Secret 不出现在状态、RPC 和日志的负向用例。
 
@@ -104,7 +113,7 @@ App Secret 仅存在于单次浏览器请求、Host 内存与 DSH credentials。
 
 ## 8. 自动测试覆盖
 
-fake 测试覆盖：text/post 解析、非法事件、双键去重、prompt 失败重试、并发 FIFO、广播、completed turn 聚合、interrupted 片段与非 completed turn 抑制、DSH/DevLead source 过滤、永久飞书业务码与单收件人失败隔离、稳定 UUID 重试、永久 pending 请求取消、关闭时排队连接、状态原子保存/读取、损坏状态旁置与控制器恢复、并发状态更新、配置连接生命周期、Secret 脱敏、管理 envelope 校验、Client 两个设置 slot 与响应校验。另以真实 SDK `Client` / `WSClient` 加本地 Axios adapter（无网络）验证 tenant token、消息发送、WebSocket endpoint 和 `$return_headers` 的响应解包。
+fake 测试覆盖：text/post 解析、非法事件、双键去重、prompt 失败重试、并发 FIFO、广播、completed turn 聚合、interrupted 片段与非 completed turn 抑制、DSH/DevLead source 过滤、永久飞书业务码与单收件人失败隔离、稳定 UUID 重试、永久 pending 请求取消、关闭时排队连接、状态原子保存/读取、损坏状态旁置、I/O 错误/非普通文件/超限文件不旁置、旁置 rename 失败上抛、控制器恢复、并发状态更新、配置连接生命周期、Secret 脱敏、管理 envelope 校验、Client 两个设置 slot 与响应校验。另以真实 SDK `Client` / `WSClient` 加本地 Axios adapter（无网络）验证 tenant token、消息发送、WebSocket endpoint 和 `$return_headers` 的响应解包。
 
 测试边界：`tests/host-adapters.spec.ts` 的 Cordis `Context` 和 Session Controller 全部是 mock，只验证本插件构造的 list/prompt 调用形状；安装版签名兼容性来自对目标 ASAR 源码的只读核对，不等同于真实 Host 集成测试。SDK 测试也只使用本地 HTTP adapter，不验证飞书实际权限、事件投递或 WebSocket 服务行为。
 

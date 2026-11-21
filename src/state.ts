@@ -23,6 +23,22 @@ export class StateRecoveryError extends Error {
   }
 }
 
+/**
+ * The state path exists but cannot be treated as a state document: it is not a
+ * regular file, it exceeds the size limit, or a corrupt document could not be
+ * quarantined. The file is left untouched and the store stays unloaded.
+ */
+export class StateFileError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options)
+    this.name = 'StateFileError'
+  }
+}
+
+function isMissingFileError(error: unknown): boolean {
+  return (error as { code?: unknown } | null)?.code === 'ENOENT'
+}
+
 function nonEmpty(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0
 }
@@ -118,24 +134,74 @@ export class FileStateStore implements StateStore {
     if (this.loaded) return this.current
     const result = this.queue.then(async () => {
       if (this.loaded) return
-      try {
-        const info = await stat(this.path)
-        if (!info.isFile() || info.size > MAX_STATE_BYTES) throw new Error('Feishu Omni state file is too large')
-        this.current = normalizeState(JSON.parse(await readFile(this.path, 'utf8')))
-      } catch (error) {
-        if ((error as { code?: unknown }).code !== 'ENOENT') {
-          const quarantinePath = `${this.path}.corrupt-${randomUUID()}`
-          await rename(this.path, quarantinePath)
-          this.current = emptyState()
-          this.loaded = true
-          throw new StateRecoveryError(quarantinePath, error)
-        }
+      const raw = await this.readRaw()
+      if (raw === null) {
+        // A missing state file is the normal first-run case, not corruption.
+        this.loaded = true
+        return
       }
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(raw)
+      } catch (error) {
+        throw await this.quarantine(error)
+      }
+      let next: PersistedState
+      try {
+        next = normalizeState(parsed)
+      } catch (error) {
+        throw await this.quarantine(error)
+      }
+      this.current = next
       this.loaded = true
     })
     this.queue = result.catch(() => {})
     await result
     return this.current
+  }
+
+  /**
+   * Read the raw document, returning null when it does not exist. Only ENOENT is
+   * translated; every other stat/read failure propagates unchanged so a valid
+   * file is never quarantined because of an I/O problem.
+   */
+  private async readRaw(): Promise<string | null> {
+    try {
+      const info = await stat(this.path)
+      if (!info.isFile()) {
+        throw new StateFileError(`Feishu Omni state path is not a regular file: ${this.path}`)
+      }
+      if (info.size > MAX_STATE_BYTES) {
+        throw new StateFileError(
+          `Feishu Omni state file is too large (${info.size} bytes; the limit is ${MAX_STATE_BYTES} bytes): ${this.path}; it was left untouched`,
+        )
+      }
+      return await readFile(this.path, 'utf8')
+    } catch (error) {
+      if (isMissingFileError(error)) return null
+      throw error
+    }
+  }
+
+  /**
+   * Preserve a genuinely corrupt document beside the state path and make the
+   * store usable with an empty state. A failed rename propagates as a real error
+   * (the original is still in place and the store stays unloaded) instead of
+   * silently starting empty.
+   */
+  private async quarantine(cause: unknown): Promise<StateRecoveryError> {
+    const quarantinePath = `${this.path}.corrupt-${randomUUID()}`
+    try {
+      await rename(this.path, quarantinePath)
+    } catch (error) {
+      throw new StateFileError(
+        `Feishu Omni state was corrupt but could not be moved to ${quarantinePath}; the original file is untouched: ${this.path}`,
+        { cause: error },
+      )
+    }
+    this.current = emptyState()
+    this.loaded = true
+    return new StateRecoveryError(quarantinePath, cause)
   }
 
   snapshot(): PersistedState {

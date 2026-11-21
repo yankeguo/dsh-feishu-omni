@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -12,6 +12,9 @@ const directories: string[] = []
 afterEach(async () => {
   await Promise.all(directories.splice(0).map(path => rm(path, { recursive: true, force: true })))
 })
+
+/** Permission-bit assertions are unreliable when the test runs as root. */
+const runningAsRoot = process.getuid?.() === 0
 
 function setup(initial = emptyState()) {
   const state = new MemoryStateStore(initial)
@@ -162,6 +165,28 @@ describe('OmniController', () => {
     })
     expect((await controller.status()).lastError).toBeNull()
     await controller.close()
+  })
+
+  it.skipIf(runningAsRoot)('fails initialization on state I/O errors instead of quarantining', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'dfo-controller-io-'))
+    directories.push(directory)
+    const path = join(directory, 'state.json')
+    await writeFile(path, JSON.stringify(emptyState()))
+    await chmod(path, 0o000)
+    try {
+      const state = new FileStateStore(path)
+      const controller = new OmniController({
+        state,
+        sessions: new FakeSessions(),
+        credentials: new FakeCredentials(),
+        gatewayFactory: () => new FakeGateway(),
+      })
+      // Only StateRecoveryError is absorbed; an unreadable file must surface.
+      await expect(controller.initialize()).rejects.toMatchObject({ code: 'EACCES' })
+      expect(await readdir(directory)).toEqual(['state.json'])
+    } finally {
+      await chmod(path, 0o600)
+    }
   })
 
   it('restores auto-connect after initialization and exposes only redacted errors', async () => {
