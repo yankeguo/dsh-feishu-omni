@@ -559,6 +559,32 @@ describe('OmniBridge present deliverables', () => {
     expect(gateway.cards.map(row => row.markdown)).toEqual(['done', 'next'])
     expect(logs.some(log => log.level === 'warn' && log.message.includes('after its turn ended'))).toBe(true)
   })
+
+  it('bounds its memory of ended turns to the 256 most recent ones', async () => {
+    const dir = await tempDir()
+    const file = join(dir, 'late.pdf')
+    await writeFile(file, '%PDF')
+    const { bridge, gateway, logs } = setupInDir(dir)
+    // End turns 1..257: the 257th insertion evicts the oldest entry (turn 1),
+    // so exactly turns 2..257 stay remembered instead of growing without bound.
+    for (let turn = 1; turn <= 257; turn += 1) {
+      await bridge.sessionEvent(SESSION.sessionId, turnEnd(turn, turn))
+    }
+    // The newest ended turn is still recognized...
+    await bridge.sessionEvent(SESSION.sessionId, presentedEvent(1000, 257, [{ path: file }]))
+    // ...and so is the oldest retained turn (2)...
+    await bridge.sessionEvent(SESSION.sessionId, presentedEvent(1001, 2, [{ path: file }]))
+    // ...while evicted turn 1 is forgotten: no "after its turn ended" warning.
+    await bridge.sessionEvent(SESSION.sessionId, presentedEvent(1002, 1, [{ path: file }]))
+    await bridge.drain()
+    const warnings = logs.filter(log => log.level === 'warn' && log.message.includes('after its turn ended'))
+    expect(warnings).toHaveLength(2)
+    // No turn/end follows, so the forgotten turn's buffered present is never
+    // delivered and the bounded set produces no outbound traffic.
+    expect(gateway.sent).toEqual([])
+    expect(gateway.cards).toEqual([])
+    expect(gateway.uploadedFileRequests).toEqual([])
+  })
 })
 
 describe('OmniBridge inline card images', () => {

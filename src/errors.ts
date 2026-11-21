@@ -133,6 +133,13 @@ export type AttachmentRejectionClass =
   | 'invalid-image'
   | 'too-many-images'
 
+/**
+ * `IMAGE_TOO_LARGE` bounds one image; `IMAGES_TOO_LARGE` bounds the byte sum of
+ * a whole prompt batch (e.g. 20 images totaling over 200 MiB). Both are
+ * caller-correctable by shrinking or removing images, so they share the
+ * `'image-bytes'` class whose sender-facing notice mentions both reducing the
+ * image count and compressing.
+ */
 const IMAGE_BYTE_LIMIT_CODES: ReadonlySet<string> = new Set(['IMAGE_TOO_LARGE', 'IMAGES_TOO_LARGE'])
 const IMAGE_PIXEL_LIMIT_CODES: ReadonlySet<string> = new Set([
   'IMAGE_TOO_MANY_PIXELS', // pixel-count limit

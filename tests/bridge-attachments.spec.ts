@@ -317,6 +317,7 @@ describe('OmniBridge inbound images', () => {
 describe('DSH attachment rejection degradation', () => {
   it.each([
     ['IMAGE_TOO_LARGE', '字节上限'],
+    ['IMAGES_TOO_LARGE', '减少图片数量或压缩后重试'],
     ['IMAGE_TOO_MANY_PIXELS', '像素或尺寸'],
     ['IMAGE_DIMENSION_TOO_LARGE', '像素或尺寸'],
     ['UNSUPPORTED_IMAGE_TYPE', 'PNG/JPEG/WEBP/GIF'],
@@ -365,6 +366,26 @@ describe('DSH attachment rejection degradation', () => {
     expect(sessions.prompts).toEqual([])
     expect(gateway.reactionAttempts).toEqual([])
     expect(gateway.sent[0]?.text).toContain('字节上限')
+  })
+
+  it('suggests fewer images or compression for the aggregate IMAGES_TOO_LARGE limit', async () => {
+    const { bridge, sessions, gateway } = setup()
+    // IMAGES_TOO_LARGE is the batch-wide byte sum (for example 20 images over
+    // 200 MiB), so "compress" alone is not the only remedy the sender has.
+    sessions.promptHook = async () => {
+      throw Object.assign(new Error('Image batch exceeds the configured aggregate image-byte limit.'), {
+        isDSHRemoteError: true,
+        code: 'session/attachment-invalid',
+        details: { reason: 'IMAGES_TOO_LARGE' },
+      })
+    }
+    gateway.downloads.set('img_v3_1', PNG_BYTES)
+    await bridge.receive(imageEvent())
+    await bridge.drain()
+    expect(sessions.prompts).toEqual([])
+    expect(gateway.reactionAttempts).toEqual([])
+    expect(gateway.sent[0]?.text).toContain('整条消息合计')
+    expect(gateway.sent[0]?.text).toContain('减少图片数量或压缩后重试')
   })
 
   it('keeps the generic notice for a storage AttachmentError code', async () => {

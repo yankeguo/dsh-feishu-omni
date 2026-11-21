@@ -29,9 +29,18 @@ export function defaultStatePath(): string {
 
 /**
  * Convention fallback for the DSH attachment store root when the mounted
- * `ctx.attachments` service does not publish one. The local backend uses
- * `$DSH_HOME/attachments/v1`; outbound uploads may reference files inside it so
- * an agent can present a file it received as an inbound attachment.
+ * `ctx.attachments` service does not publish one. The primary source is
+ * `ctx.attachments.root` (verified on the rc.5 desktop composition); this
+ * fallback only covers non-standard/fixture compositions whose local backend
+ * exposes no root. It follows the `$DSH_HOME/attachments/v1` convention but
+ * deliberately does not replicate DSH's `resolveDshHome` semantics: a leading
+ * `~` is not expanded, a blank/whitespace-only `DSH_HOME` is treated as a
+ * literal value (and would yield a relative path), and an explicit `dshHome`
+ * configuration is ignored. Outbound uploads may still reference files inside
+ * the resolved root so an agent can present a file it received as an inbound
+ * attachment; a blank `DSH_HOME` producing a relative root is dropped by the
+ * fail-closed containment resolver instead of being resolved against the Host
+ * process cwd.
  */
 export function defaultAttachmentRoot(): string {
   const home = process.env.DSH_HOME ?? join(homedir(), '.dsh')
@@ -56,7 +65,8 @@ export async function apply(ctx: Context, rawConfig: Partial<Config> = {}): Prom
     ...(attachments === undefined ? {} : { attachments }),
     // Outbound uploads may reference the Session workspace or the DSH
     // attachment store only. Prefer the mounted store's own root (it honors a
-    // custom dshHome) and fall back to the documented convention.
+    // custom dshHome and is available on the rc.5 desktop composition) and fall
+    // back to the documented convention only for stripped/fixture compositions.
     attachmentRoots: () => [dshAttachmentRoot(ctx) ?? defaultAttachmentRoot()],
   })
   await controller.initialize()

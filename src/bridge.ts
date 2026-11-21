@@ -244,7 +244,9 @@ function attachmentFailureOf(code: string | undefined, error: unknown): Attachme
 function imageRejectionNotice(kind: AttachmentRejectionClass): string {
   switch (kind) {
     case 'image-bytes':
-      return '图片超过 DSH 附件服务的字节上限，未投递到 Session，请压缩后重试。'
+      // One image over the per-image limit and a whole batch over the aggregate
+      // limit share this class, so the hint covers both remedies.
+      return '图片超过 DSH 附件服务的字节上限（单张图片或整条消息合计），未投递到 Session，请减少图片数量或压缩后重试。'
     case 'image-pixels':
       return '图片像素或尺寸超过 DSH 附件服务上限，未投递到 Session，请缩小后重试。'
     case 'unsupported-image':

@@ -225,7 +225,7 @@ pnpm run verify
   - 文件缺失/为空/超限/上传失败 → 该 chat 收到文本降级（只含文件名、大小与原因，**不带本机路径**），不影响其他 chat 与其他文件。
 - **卡片内联图片**：最终助手回复里形如 `![说明](<path>)` / `![说明](path)` 的本地图片会被上传为飞书 `image_key`，并改写为卡片 markdown 的 `![说明](image_key)` 内联显示。相对路径按 Session 工作目录解析（含 `working-directory/change` 后的新目录）。HTTP(S) URL、已经是 `image_key` 的引用、fenced code block、4 列缩进的代码块（tab 按 4 列 tab stop 展开；引用块/列表容器内的缩进代码也识别）、行内代码、反斜杠转义的 `\![说明](path)`、不存在/非图片/工作区与 DSH 附件目录之外的文件、上传失败的引用都**原样保留**；`present` 已声明过的同一路径不会再内联（避免同一张图显示两次）。纯 Markdown 文件链接（`[说明](<path>)`）不会自动推送，避免刷屏。
 - **失败隔离与重试**：同一 turn 先卡片后附件；交付物上传/发送沿用可重试码（限频、超时、5xx）的指数退避与同一 UUID，重试耗尽或永久错误才降级为文本，不影响后续收件人/文件。单 turn 最多交付 32 个 present 文件，超出部分记 warning 并跳过。
-- **出站路径范围（防注入外发）**：`present` 交付物与卡片内联图片**只桥接 Session 工作区或 DSH 附件目录内的文件**。相对路径先按 Session 工作目录解析，然后 `realpath` 解析 symlink（并统一大小写），最终真实路径必须严格位于允许根内（等于根，或以 `根 + 路径分隔符` 开头）；symlink 指向根外一律拒绝。允许根是：① 绑定 Session 的 cwd（含 `working-directory/change` 后的新目录）；② DSH 附件目录（优先用 `ctx.attachments` 暴露的根，否则按约定 `$DSH_HOME/attachments/v1`，未设置 `DSH_HOME` 时为 `~/.dsh/attachments/v1`）。根外文件不会被读取或上传：`present` 降级为文本提示（只含文件名、大小与原因，如「文件不在会话工作区或 DSH 附件目录内，未发送」，**不含本机绝对路径**），卡片内联图片保留原 Markdown 文本。**其它位置的文件请让 agent 先复制进 Session 工作区**再 `present`/引用。
+- **出站路径范围（防注入外发）**：`present` 交付物与卡片内联图片**只桥接 Session 工作区或 DSH 附件目录内的文件**。相对路径先按 Session 工作目录解析，然后 `realpath` 解析 symlink（并统一大小写），最终真实路径必须严格位于允许根内（等于根，或以 `根 + 路径分隔符` 开头）；symlink 指向根外一律拒绝。允许根是：① 绑定 Session 的 cwd（含 `working-directory/change` 后的新目录）；② DSH 附件目录（优先用 `ctx.attachments` 暴露的根，rc.5 desktop 组合已核对可用；仅非标准/fixture composition 未暴露根时退回 `$DSH_HOME/attachments/v1` 约定兜底，未设置 `DSH_HOME` 时为 `~/.dsh/attachments/v1`，且该兜底不完整复刻 DSH `resolveDshHome` 语义——不展开 `~`、把空白 `DSH_HOME` 当字面值、忽略显式 `dshHome` 配置）。收敛要求**至少一个已知允许根**：cwd 与附件根都不可用时，绝对工作区路径同样会被拒绝（fail closed），不只是相对路径依赖 cwd。根外文件不会被读取或上传：`present` 降级为文本提示（只含文件名、大小与原因，如「文件不在会话工作区或 DSH 附件目录内，未发送」，**不含本机绝对路径**），卡片内联图片保留原 Markdown 文本。**其它位置的文件请让 agent 先复制进 Session 工作区**再 `present`/引用。
 - **预期保留原文**：卡片内联图片上传失败、文件不是图片、或该路径已被 `present` 作为图片消息发送（去重）时，卡片会原样保留 `![说明](<path>)` 文本（飞书客户端可能显示为破图/路径文本）；这只是 Markdown 文本，**不含也不会上传本机文件字节**，属于预期行为。
 
 ### 大小限制与降级
@@ -247,7 +247,7 @@ pnpm run verify
 - 非秘密配置、绑定和最近去重键：`$DSH_HOME/integrations/dsh-feishu-omni/state.json`（未设置 `DSH_HOME` 时为 `~/.dsh/...`）。写入采用临时文件原子替换，文件权限 `0600`。读取时只把**内容损坏**（JSON 解析失败，或 schema/版本/绑定校验失败）的 `state.json` 改名为旁边的 `state.json.corrupt-*`，以空状态启动，设置页的最近错误会显示恢复信息，原文件不会直接删除。其它读 I/O 错误（如权限不足 EACCES）、非普通文件、超过 1 MiB 的文件不会被旁置或覆盖：插件初始化直接报错，文件保持原样，需要人工检查；旁置本身失败也按错误上抛，不会以空状态继续。
 - App Secret：DSH credentials 引用 `DSH_FEISHU_OMNI_APP_SECRET`，由本机 DSH credential provider 保存。
 - 附件字节：入站由 DSH 附件服务按内容寻址保存（`$DSH_HOME/attachments/v1`，未设置 `DSH_HOME` 时为 `~/.dsh/attachments/v1`，**永不自动清理**）；出站图片需要规范化时也写入同一服务。插件不建自己的附件目录，日志只记录资源 key / 文件名 / 大小 / 脱敏错误摘要，不记录字节或 Secret；本插件自身的文件系统错误只记错误码（如 `ENOENT`），不记绝对路径（第三方库回传的错误摘要无法完全保证）。
-- 出站路径白名单：`present` 交付物与卡片内联图片只读取 Session 工作区或 DSH 附件目录内的普通非空文件（`realpath` 收敛 + 严格前缀边界，symlink 指向根外拒绝）；这是为了防止共享 Session 被 prompt 注入后把本机任意文件外发到所有绑定飞书用户。根外文件只出现在降级提示的文件名/大小里，不读取、不上传、不记录绝对路径。
+- 出站路径白名单：`present` 交付物与卡片内联图片只读取 Session 工作区或 DSH 附件目录内的普通非空文件（`realpath` 收敛 + 严格前缀边界，symlink 指向根外拒绝；cwd 与附件根都不可用时绝对路径也拒绝，fail closed）；这是为了防止共享 Session 被 prompt 注入后把本机任意文件外发到所有绑定飞书用户。根外文件只出现在降级提示的文件名/大小里，不读取、不上传、不记录绝对路径。
 - 管理 RPC 复用 DSH 已认证的 `/api` 通道，不新增端口，不读取或重写 profile 的 `cordis.patch.yml`。
 - 仓库、测试夹具、状态响应和插件日志均不应包含真实 Secret。
 
