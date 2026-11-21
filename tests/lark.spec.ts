@@ -232,3 +232,94 @@ describe('official Lark gateway attachments', () => {
     })
   })
 })
+
+describe('official Lark gateway download edge cases', () => {
+  function handleFrom(source: AsyncIterable<Uint8Array>) {
+    return {
+      writeFile: vi.fn(async () => {}),
+      getReadableStream: () => source as never,
+      headers: {},
+    }
+  }
+
+  it('cancels the underlying stream iterator when the bridge stops', async () => {
+    const fake = fakeSdk()
+    let returned = false
+    const source: AsyncIterable<Uint8Array> = {
+      [Symbol.asyncIterator]: () => ({
+        next: async () => ({ done: false, value: Buffer.alloc(64, 1) }),
+        return: async () => {
+          returned = true
+          return { done: true, value: undefined }
+        },
+      }),
+    }
+    fake.resourceGet.mockResolvedValueOnce(handleFrom(source))
+    const gateway = createLarkGatewayFactory(fake.sdk)('cli_0123456789abcdef', 'secret-fixture', callbacks)
+    const download = await gateway.downloadResource('om_original', 'img_v3_key', 'image')
+    expect(download.head.byteLength).toBe(64)
+    await download.cancel()
+    expect(returned).toBe(true)
+  })
+
+  it('replays a resource shorter than the head buffer exactly once', async () => {
+    const fake = fakeSdk()
+    const tiny = Buffer.from('tiny-body')
+    fake.resourceGet.mockResolvedValueOnce({
+      writeFile: vi.fn(async () => {}),
+      getReadableStream: () => Readable.from([tiny]),
+      headers: {},
+    })
+    const gateway = createLarkGatewayFactory(fake.sdk)('cli_0123456789abcdef', 'secret-fixture', callbacks)
+    const download = await gateway.downloadResource('om_original', 'file_v3_key', 'file')
+    expect(download.head).toEqual(new Uint8Array(tiny))
+    const chunks: Uint8Array[] = []
+    for await (const chunk of download.data) chunks.push(chunk)
+    expect(Buffer.concat(chunks)).toEqual(tiny)
+    const again: Uint8Array[] = []
+    for await (const chunk of download.data) again.push(chunk)
+    expect(again).toEqual([])
+  })
+
+  it('surfaces a stream error after the head as a download failure', async () => {
+    const fake = fakeSdk()
+    const source: AsyncIterable<Uint8Array> = {
+      [Symbol.asyncIterator]: () => {
+        let step = 0
+        return {
+          next: async () => {
+            step += 1
+            if (step === 1) return { done: false, value: Buffer.alloc(64, 2) }
+            throw new Error('socket reset')
+          },
+          return: async () => ({ done: true, value: undefined }),
+        }
+      },
+    }
+    fake.resourceGet.mockResolvedValueOnce(handleFrom(source))
+    const gateway = createLarkGatewayFactory(fake.sdk)('cli_0123456789abcdef', 'secret-fixture', callbacks)
+    const download = await gateway.downloadResource('om_original', 'file_v3_key', 'file')
+    const failure = await (async () => {
+      try {
+        for await (const _chunk of download.data) { /* drain */ }
+      } catch (error) {
+        return error
+      }
+      return undefined
+    })()
+    expect(failure).toMatchObject({ name: 'AttachmentFailure', reason: 'download' })
+  })
+
+  it('passes the cancellation signal to image and file upload clients', async () => {
+    const fake = fakeSdk()
+    const gateway = createLarkGatewayFactory(fake.sdk)('cli_0123456789abcdef', 'secret-fixture', callbacks)
+    const imageSignal = new AbortController().signal
+    await gateway.uploadImage(new Uint8Array([1]), imageSignal)
+    const imageOptions = fake.clientOptions.at(-1) as { httpInstance: { defaults: { signal?: AbortSignal } } }
+    expect(imageOptions.httpInstance.defaults.signal).toBe(imageSignal)
+    const fileSignal = new AbortController().signal
+    await gateway.uploadFile(new Uint8Array([2]), 'a.pdf', 'pdf', fileSignal)
+    const fileOptions = fake.clientOptions.at(-1) as { httpInstance: { defaults: { signal?: AbortSignal } } }
+    expect(fileOptions.httpInstance.defaults.signal).toBe(fileSignal)
+  })
+})

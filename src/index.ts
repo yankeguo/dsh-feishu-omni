@@ -44,6 +44,10 @@ export async function apply(ctx: Context, rawConfig: Partial<Config> = {}): Prom
   })
   await controller.initialize()
   ctx.effect(() => registerManagementRoute(ctx, controller), 'feishu-omni: management route')
-  ctx.on('session/event', (session, event) => controller.sessionEvent(session.id, event), { global: true })
+  // The listener's first argument is the live Session, so the bridge can learn
+  // the Session cwd for relative Markdown image / present paths without I/O.
+  ctx.on('session/event', (session, event) => {
+    controller.sessionEvent(session.id, event, session.header?.cwd)
+  }, { global: true })
   ctx.effect(() => async () => controller.close(), 'feishu-omni: close bridge')
 }

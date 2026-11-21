@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import { AttachmentFailure } from '../src/attachments.ts'
 import { ACK_EMOJI, OmniBridge } from '../src/bridge.ts'
 import { emptyState, MemoryStateStore } from '../src/state.ts'
 import type { Binding, AttachmentPort, FileUploadPort } from '../src/types.ts'
@@ -68,7 +69,7 @@ describe('OmniBridge inbound images', () => {
       sessionId: SESSION.sessionId,
       requestId: 'feishu-omni:om_1:oc_alice',
       text: '[飞书 · 张三]\n（图片）',
-      attachments: [{ receiptId: 'receipt-image-1', kind: 'image' }],
+      attachments: [{ receiptId: 'receipt-image-1' }],
     }])
     expect(gateway.reactionAttempts).toEqual([{ messageId: 'om_1', emojiType: ACK_EMOJI }])
     expect(state.snapshot().recentEventIds).toEqual(['message:om_1', 'event:event-1'])
@@ -101,8 +102,8 @@ describe('OmniBridge inbound images', () => {
     expect(fileUploads?.imageUploads).toHaveLength(2)
     expect(sessions.prompts[0]?.text).toBe('[飞书 · 张三]\n图文\n看这个\n（图片）\n（图片）')
     expect(sessions.prompts[0]?.attachments).toEqual([
-      { receiptId: 'receipt-image-1', kind: 'image' },
-      { receiptId: 'receipt-image-2', kind: 'image' },
+      { receiptId: 'receipt-image-1' },
+      { receiptId: 'receipt-image-2' },
     ])
   })
 
@@ -197,8 +198,8 @@ describe('OmniBridge inbound images', () => {
     expect(gateway.reactionAttempts).toHaveLength(1)
   })
 
-  it('cancels a stalled download when the bridge stops', async () => {
-    const { bridge, gateway } = setup({ attachmentTimeoutMs: 60_000 })
+  it('cancels a stalled download when the bridge stops without marking the message seen', async () => {
+    const { bridge, gateway, state } = setup({ attachmentTimeoutMs: 60_000 })
     gateway.downloadHandles.set('img_v3_1', () => ({
       head: new Uint8Array(PNG_BYTES),
       data: (async function* stalled(): AsyncIterable<Uint8Array> {
@@ -209,9 +210,107 @@ describe('OmniBridge inbound images', () => {
     }))
     await bridge.receive(imageEvent())
     await vi.waitFor(() => expect(gateway.downloadRequests).toHaveLength(1))
+    const downloadSignal = gateway.downloadRequests[0]?.signal
     await bridge.stop()
     await bridge.drain()
     expect(gateway.stops).toBe(1)
+    // The in-flight download is cancelled through the same lifecycle signal.
+    expect(downloadSignal?.aborted).toBe(true)
+    // Shutdown is not a terminal payload failure: a restart may retry this event.
+    expect(state.snapshot().recentEventIds).toEqual([])
+    expect(gateway.reactionAttempts).toEqual([])
+  })
+
+  it('degrades before buffering when Content-Length exceeds the image bound', async () => {
+    const { bridge, gateway, sessions } = setup()
+    let consumed = false
+    let cancelled = false
+    gateway.downloadHandles.set('img_v3_1', () => ({
+      head: new Uint8Array(PNG_BYTES),
+      size: 20 * 1024 * 1024 + 1,
+      data: (async function* body(): AsyncIterable<Uint8Array> {
+        consumed = true
+        yield new Uint8Array()
+      })(),
+      cancel: async () => { cancelled = true },
+    }))
+    await bridge.receive(imageEvent())
+    await bridge.drain()
+    expect(consumed).toBe(false)
+    expect(cancelled).toBe(true)
+    expect(sessions.prompts).toEqual([])
+    expect(gateway.sent[0]?.text).toContain('超过大小限制')
+  })
+
+  it('rejects an unsupported image from the sniffed head before reading the body', async () => {
+    const { bridge, gateway, sessions } = setup()
+    let consumed = false
+    gateway.downloadHandles.set('img_v3_1', () => ({
+      head: new Uint8Array(HEIC_BYTES),
+      size: HEIC_BYTES.byteLength,
+      data: (async function* body(): AsyncIterable<Uint8Array> {
+        consumed = true
+        yield HEIC_BYTES
+      })(),
+      cancel: async () => {},
+    }))
+    await bridge.receive(imageEvent())
+    await bridge.drain()
+    expect(consumed).toBe(false)
+    expect(sessions.prompts).toEqual([])
+    expect(gateway.sent[0]?.text).toContain('HEIC')
+  })
+
+  it('preserves a DSH size rejection wrapped by the upload service', async () => {
+    const { bridge, fileUploads, gateway, sessions } = setup()
+    gateway.downloads.set('file_v3_1', Buffer.from('x'))
+    fileUploads?.failures.push(Object.assign(new Error('failed to store file upload'), {
+      isDSHRemoteError: true,
+      code: 'gateway/internal',
+      cause: new AttachmentFailure('Feishu file download exceeded the limit', 'too-large'),
+    }))
+    await bridge.receive(feishuEvent({ messageType: 'file', content: { file_key: 'file_v3_1', file_name: 'a.bin' } }))
+    await bridge.drain()
+    expect(sessions.prompts).toEqual([])
+    expect(gateway.sent[0]?.text).toContain('超过大小限制')
+  })
+
+  it('degrades a message carrying too many attachments', async () => {
+    const { bridge, gateway, sessions } = setup()
+    const images = Array.from({ length: 21 }, (_, index) => ({ tag: 'img', image_key: `img_v3_${index}` }))
+    await bridge.receive(feishuEvent({
+      messageType: 'post',
+      content: { title: 't', content: [[{ tag: 'text', text: 'many' }], images] },
+    }))
+    await bridge.drain()
+    expect(gateway.downloadRequests).toEqual([])
+    expect(sessions.prompts).toEqual([])
+    expect(gateway.sent[0]?.text).toContain('附件过多')
+  })
+
+  it('explains a download permission failure with the required scope', async () => {
+    const { bridge, gateway, sessions } = setup()
+    gateway.downloadFailures.set('img_v3_1', [Object.assign(new Error('no scope'), { code: 99991672 })])
+    await bridge.receive(imageEvent())
+    await bridge.drain()
+    expect(sessions.prompts).toEqual([])
+    expect(gateway.sent[0]?.text).toContain('im:message:readonly')
+  })
+
+  it('degrades an attachment whose download stalls past the attachment timeout', async () => {
+    const { bridge, gateway, sessions } = setup({ attachmentTimeoutMs: 20 })
+    gateway.downloadHandles.set('file_v3_1', () => ({
+      head: new Uint8Array([1, 2, 3]),
+      data: (async function* stalled(): AsyncIterable<Uint8Array> {
+        await new Promise<void>(() => {})
+        yield new Uint8Array()
+      })(),
+      cancel: async () => {},
+    }))
+    await bridge.receive(feishuEvent({ messageType: 'file', content: { file_key: 'file_v3_1', file_name: 'a.bin' } }))
+    await bridge.drain()
+    expect(sessions.prompts).toEqual([])
+    expect(gateway.sent[0]?.text).toContain('超时')
   })
 })
 
@@ -233,7 +332,7 @@ describe('OmniBridge inbound files', () => {
     expect(fileUploads?.fileUploads[0]?.bytes).toEqual(new Uint8Array(bytes))
     expect(sessions.prompts[0]).toMatchObject({
       text: '[飞书 · 张三]\n（文件：报告.pdf）',
-      attachments: [{ receiptId: 'receipt-file-1', kind: 'file' }],
+      attachments: [{ receiptId: 'receipt-file-1' }],
     })
     expect(gateway.reactionAttempts).toEqual([{ messageId: 'om_1', emojiType: ACK_EMOJI }])
   })
@@ -304,13 +403,40 @@ describe('OmniBridge inbound attachment mirror', () => {
   it('falls back to a placeholder text when the mirror upload fails, without failing the prompt', async () => {
     const { bridge, gateway, sessions } = setup({ bindings: [alice, bob] })
     gateway.downloads.set('img_v3_1', PNG_BYTES)
-    gateway.imageUploadFailures.push(new Error('missing im:resource scope'))
+    // Exhaust the upload retry ladder with a permanent-looking failure.
+    gateway.imageUploadFailures.push(
+      Object.assign(new Error('missing im:resource scope'), { code: 99991672 }),
+      Object.assign(new Error('missing im:resource scope'), { code: 99991672 }),
+      Object.assign(new Error('missing im:resource scope'), { code: 99991672 }),
+    )
     await bridge.receive(imageEvent())
     await bridge.drain()
     expect(sessions.prompts).toHaveLength(1)
     expect(gateway.reactionAttempts).toHaveLength(1)
     expect(gateway.images).toEqual([])
     expect(gateway.sent).toEqual([{ chatId: 'oc_bob', text: '[图片]', uuid: expect.stringMatching(/^dshfo_/) }])
+  })
+
+  it('retries a transient mirror send failure before giving up', async () => {
+    const { bridge, gateway } = setup({ bindings: [alice, bob] })
+    gateway.downloads.set('img_v3_1', PNG_BYTES)
+    gateway.imageSendFailures.set('oc_bob', [Object.assign(new Error('rate limited'), { code: 230020 })])
+    await bridge.receive(imageEvent())
+    await bridge.drain()
+    expect(gateway.imageAttempts.filter(row => row.chatId === 'oc_bob')).toHaveLength(2)
+    expect(gateway.images.map(row => row.chatId)).toEqual(['oc_bob'])
+    expect(gateway.sent).toEqual([])
+  })
+
+  it('falls back to placeholder text with the same uuid when mirror delivery keeps failing', async () => {
+    const { bridge, gateway } = setup({ bindings: [alice, bob] })
+    gateway.downloads.set('img_v3_1', PNG_BYTES)
+    gateway.imageSendFailures.set('oc_bob', [Object.assign(new Error('bot removed'), { code: 230002 })])
+    await bridge.receive(imageEvent())
+    await bridge.drain()
+    expect(gateway.images).toEqual([])
+    const attempt = gateway.imageAttempts.find(row => row.chatId === 'oc_bob')
+    expect(gateway.sent).toEqual([{ chatId: 'oc_bob', text: '[图片]', uuid: attempt?.uuid }])
   })
 
   it('logs a mirror delivery failure without affecting the other binding', async () => {
@@ -347,6 +473,29 @@ describe('OmniBridge inbound attachment mirror', () => {
     await second.bridge.receive(imageEvent())
     await second.bridge.drain()
     expect(first.gateway.images[0]?.uuid).toBe(second.gateway.images[0]?.uuid)
+  })
+
+  it('gives each attachment of one message its own deterministic uuid', async () => {
+    const { bridge, gateway } = setup({ bindings: [alice, bob] })
+    gateway.downloads.set('img_v3_one', PNG_BYTES)
+    gateway.downloads.set('img_v3_two', GIF_BYTES)
+    await bridge.receive(feishuEvent({
+      messageType: 'post',
+      content: { content: [[{ tag: 'img', image_key: 'img_v3_one' }, { tag: 'img', image_key: 'img_v3_two' }]] },
+    }))
+    await bridge.drain()
+    const uuids = gateway.imageAttempts.map(row => row.uuid)
+    expect(uuids).toHaveLength(2)
+    expect(new Set(uuids).size).toBe(2)
+  })
+
+  it('falls back to placeholder for a 10-20 MiB image when no normalization service exists', async () => {
+    const { bridge, gateway } = setup({ bindings: [alice, bob], attachments: null })
+    gateway.downloads.set('img_v3_1', Buffer.concat([PNG_BYTES, Buffer.alloc(11 * 1024 * 1024)]))
+    await bridge.receive(imageEvent())
+    await bridge.drain()
+    expect(gateway.imageUploads).toEqual([])
+    expect(gateway.sent).toEqual([{ chatId: 'oc_bob', text: '[图片]', uuid: expect.stringMatching(/^dshfo_/) }])
   })
 
   it('mirrors a message with no other binding without uploading anything', async () => {

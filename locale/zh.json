@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "飞书共享 Session",
-    "description": "让多个飞书用户复用同一个既有 DSH Session，并同步所有人类输入与助手正式回复。支持 App ID/App Secret、Session 绑定、长连接状态和测试消息。"
+    "description": "让多个飞书用户复用同一个既有 DSH Session，并同步所有人类输入与助手正式回复；支持文本、图片、文件双向传递（原生 ImageBlock/FileBlock 与 present 交付物），以及 App ID/App Secret、Session 绑定、长连接状态和测试消息。"
   }
 }

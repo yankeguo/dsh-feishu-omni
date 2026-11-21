@@ -411,3 +411,20 @@ export const HEIC_BYTES = Buffer.concat([
   Buffer.from([0, 0, 0, 0]),
   Buffer.alloc(40, 0),
 ])
+
+/** `deliverables/presented` is a log-only event: it carries no surfaceOp. */
+export function presentedEvent(
+  seq: number,
+  turn: number,
+  files: readonly { path: string; description?: string }[],
+) {
+  return {
+    seq, type: 'deliverables/presented',
+    data: { turn, callId: `call-${seq}`, files },
+  }
+}
+
+/** Effective working directory change, as emitted by the DSH session package. */
+export function workingDirectoryChange(seq: number, cwd: string) {
+  return { seq, type: 'working-directory/change', data: { cwd } }
+}

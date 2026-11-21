@@ -2,7 +2,7 @@ import { Buffer } from 'node:buffer'
 import * as Lark from '@larksuiteoapi/node-sdk'
 import axios from 'axios'
 import { buildAssistantCard } from './card.ts'
-import { AttachmentFailure } from './attachments.ts'
+import { AttachmentFailure, type FeishuFileType } from './attachments.ts'
 import type { FeishuMessageEvent } from './events.ts'
 import type {
   DownloadedResource, FeishuGateway, GatewayCallbacks, GatewayFactory, SendMarkdownOptions,
@@ -193,8 +193,13 @@ class OfficialFeishuGateway implements FeishuGateway {
       throw new AttachmentFailure('Feishu resource download failed', 'download', { cause: error })
     }
     const head = concatChunks(buffered, bufferedBytes)
+    // Content-Length lets the bridge degrade an oversize resource before it
+    // reads the body; Feishu may omit it for streamed/chunked responses.
+    const rawLength = response.headers?.['content-length']
+    const declaredSize = Number(Array.isArray(rawLength) ? rawLength[0] : rawLength)
+    const size = Number.isSafeInteger(declaredSize) && declaredSize >= 0 ? declaredSize : undefined
     if (finished) {
-      return { head, data: singleChunk(head), cancel: async () => {} }
+      return { head, data: singleChunk(head), ...(size === undefined ? {} : { size }), cancel: async () => {} }
     }
     const remaining = async function* rest(): AsyncIterable<Uint8Array> {
       try {
@@ -203,6 +208,11 @@ class OfficialFeishuGateway implements FeishuGateway {
           if (next.done === true) return
           yield next.value
         }
+      } catch (error) {
+        // A read failure after the head is a download failure, not a staging one.
+        throw error instanceof AttachmentFailure
+          ? error
+          : new AttachmentFailure('Feishu resource stream failed', 'download', { cause: error })
       } finally {
         // Cancellation (lifecycle stop, timeout) destroys the HTTP stream.
         await close()
@@ -214,7 +224,7 @@ class OfficialFeishuGateway implements FeishuGateway {
       yield head
       yield* remaining
     }()
-    return { head, data, cancel: close }
+    return { head, data, ...(size === undefined ? {} : { size }), cancel: close }
   }
 
   /** Upload one image for a `msg_type=image` message and return its `image_key`. */
@@ -234,11 +244,11 @@ class OfficialFeishuGateway implements FeishuGateway {
   }
 
   /** Upload one file for a `msg_type=file` message and return its `file_key`. */
-  async uploadFile(bytes: Uint8Array, name: string, fileType: string, signal?: AbortSignal): Promise<string> {
+  async uploadFile(bytes: Uint8Array, name: string, fileType: FeishuFileType, signal?: AbortSignal): Promise<string> {
     const client = this.createClient(signal)
     const response = await client.im.v1.file.create({
       data: {
-        file_type: fileType as 'opus' | 'mp4' | 'pdf' | 'doc' | 'xls' | 'ppt' | 'stream',
+        file_type: fileType,
         file_name: name,
         file: Buffer.from(bytes),
       },

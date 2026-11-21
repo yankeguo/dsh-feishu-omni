@@ -64,6 +64,38 @@ describe('Feishu event extraction', () => {
     }
   })
 
+  it('collects post media nodes as file-like media attachments', () => {
+    const event = feishuEvent()
+    Object.assign(event.message!, {
+      message_type: 'post',
+      content: JSON.stringify({
+        content: [
+          [{ tag: 'text', text: '看视频' }],
+          [{ tag: 'media', file_key: 'file_v3_clip', image_key: 'img_cover' }],
+        ],
+      }),
+    })
+    const result = extractInboundMessage(event)
+    expect(result.kind).toBe('message')
+    if (result.kind === 'message') {
+      expect(result.message.attachments).toEqual([{ type: 'file', kind: 'media', key: 'file_v3_clip' }])
+    }
+  })
+
+  it('accepts a post containing only a media node instead of ignoring it as empty', () => {
+    const event = feishuEvent()
+    Object.assign(event.message!, {
+      message_type: 'post',
+      content: JSON.stringify({ content: [[{ tag: 'media', file_key: 'file_v3_clip' }]] }),
+    })
+    const result = extractInboundMessage(event)
+    expect(result.kind).toBe('message')
+    if (result.kind === 'message') {
+      expect(result.message.text).toBe('')
+      expect(result.message.attachments).toEqual([{ type: 'file', kind: 'media', key: 'file_v3_clip' }])
+    }
+  })
+
   it('extracts image message content as one image attachment', () => {
     const result = extractInboundMessage(feishuEvent({
       messageType: 'image',

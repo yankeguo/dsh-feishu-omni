@@ -34,10 +34,10 @@ export type AttachmentFailureReason =
   | 'download'
   /** A Feishu upload did not return a usable key. */
   | 'upload'
-  /** DSH image normalization/read failed. */
-  | 'normalize'
   /** A recognized image container outside the four formats DSH accepts. */
   | 'unsupported-image'
+  /** One Feishu message carried more attachments than this bridge accepts. */
+  | 'too-many'
 
 /** Typed attachment failure so the bridge can pick a specific degradation notice. */
 export class AttachmentFailure extends Error {
@@ -123,8 +123,10 @@ function extensionOf(name: string): string {
  * Audio/video are deliberately uploaded as `stream` instead of `opus`/`mp4`:
  * Feishu rejects a `msg_type=file` message whose uploaded `file_type` is
  * `opus`/`mp4` (business code 230055, because those must be sent as
- * `msg_type=audio`/`media`). `stream` is the documented fallback type for
- * anything outside the document enum and pairs with `msg_type=file`.
+ * `msg_type=audio`/`media`). The docs pair `stream` with `msg_type=file` as the
+ * fallback for anything outside the document enum, but whether Feishu
+ * content-sniffs audio/video bytes uploaded as `stream` is not documented and
+ * must be verified against a real tenant.
  */
 export function feishuFileType(name: string): FeishuFileType {
   switch (extensionOf(name)) {
@@ -144,15 +146,6 @@ export function feishuFileType(name: string): FeishuFileType {
     default:
       return 'stream'
   }
-}
-
-/**
- * Feishu requires a file name with a suffix for `file_type` rendering; fall
- * back to a stable generic name when the source provides none.
- */
-export function displayFileName(name: string | undefined, fallback: string): string {
-  const trimmed = name?.trim()
-  return trimmed !== undefined && trimmed.length > 0 ? trimmed : fallback
 }
 
 /** Human-readable byte count used in degradation notices. */
@@ -200,8 +193,6 @@ export interface CollectedStream {
   readonly data: AsyncIterable<Uint8Array>
   /** Buffered copy when the whole stream stayed within `collectBytes`, else `undefined`. */
   collected(): Uint8Array | undefined
-  /** Total forwarded bytes after the stream has been fully consumed. */
-  total(): number
 }
 
 /**
@@ -237,7 +228,6 @@ export function collectingStream(
   })()
   return {
     data,
-    total: () => total,
     collected: () => (overflow || chunks.length === 0 ? undefined : concatBytes(chunks, total)),
   }
 }

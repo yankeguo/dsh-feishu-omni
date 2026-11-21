@@ -112,7 +112,8 @@ const REJECTED_PAYLOAD_PROVIDER_CODES = new Set([
   230099, // card content creation failed (parent of table/parse/schema rejections)
 ])
 
-function httpStatusOf(error: unknown): number | undefined {
+/** HTTP status carried by an axios-style error, when present. */
+export function httpStatusOf(error: unknown): number | undefined {
   if (typeof error !== 'object' || error === null) return undefined
   const status = (error as { response?: { status?: unknown }; status?: unknown }).response?.status
     ?? (error as { status?: unknown }).status
@@ -255,18 +256,16 @@ function sanitizeFailureDetailMessage(message: string): string {
 }
 
 /**
- * Build a one-line, sanitized summary of a failed reaction call for logs:
- * `code=<business code> status=<HTTP status> msg=<provider msg>`, with absent
- * parts omitted. A bare axios `Request failed with status code 400` cannot tell
- * a recalled message (`231003`) from an out-of-range user (`231022`); the
- * business code and Feishu `msg` can.
+ * Build one-line, sanitized `code=/status=/msg=` provider details for logs.
+ * Used by reaction-ack and attachment failure logging: the business code and
+ * Feishu `msg` distinguish errors that a bare axios status message cannot.
  *
  * Only scalar fields of the error/response envelope are read. Request bodies,
  * message text, URLs with query strings, credentials and raw error objects never
  * appear: the provider `msg` is redacted and flattened, and the fallback message
  * is bounded and credential-redacted too.
  */
-export function reactionFailureDetail(error: unknown): string {
+export function providerFailureDetail(error: unknown): string {
   const parts: string[] = []
   const code = providerCode(error)
   if (code !== undefined) parts.push(`code=${code}`)
@@ -277,3 +276,6 @@ export function reactionFailureDetail(error: unknown): string {
   parts.push(`msg=${message || 'unknown error'}`)
   return parts.join(' ')
 }
+
+/** Backwards-compatible name for the reaction-ack logging path. */
+export const reactionFailureDetail = providerFailureDetail

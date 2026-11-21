@@ -1,7 +1,7 @@
 {
   "name": "@yankeguo/dsh-feishu-omni",
   "version": "0.1.0",
-  "description": "Share one existing DeepSeek Harness Session across Feishu users with synchronized human and assistant messages.",
+  "description": "Share one existing DeepSeek Harness Session across Feishu users with synchronized human and assistant messages, plus bidirectional images and files.",
   "license": "MIT",
   "type": "module",
   "icon": "./icon.svg",

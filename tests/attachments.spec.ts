@@ -74,7 +74,6 @@ describe('bounded stream helpers', () => {
     const stream = collectingStream(source, 10, 4, 'file')
     const forwarded = await collect(stream.data)
     expect([...forwarded]).toEqual([1, 2, 3, 4])
-    expect(stream.total()).toBe(4)
     expect(stream.collected() && [...stream.collected()!]).toEqual([1, 2, 3, 4])
   })
 
@@ -82,8 +81,28 @@ describe('bounded stream helpers', () => {
     const source = chunks(new Uint8Array(3), new Uint8Array(3))
     const stream = collectingStream(source, 10, 4, 'file')
     await collect(stream.data)
-    expect(stream.total()).toBe(6)
     expect(stream.collected()).toBeUndefined()
+  })
+
+  it('closes the source iterator when readAllBounded rejects oversize input', async () => {
+    let returned = false
+    const source: AsyncIterable<Uint8Array> = {
+      [Symbol.asyncIterator]: () => ({
+        next: async () => ({ done: false, value: new Uint8Array(6) }),
+        return: async () => {
+          returned = true
+          return { done: true, value: undefined }
+        },
+      }),
+    }
+    await expect(readAllBounded(source, 10, 'image')).rejects.toMatchObject({ reason: 'too-large' })
+    expect(returned).toBe(true)
+  })
+
+  it('keeps the mirror copy when the stream is exactly at the copy bound', async () => {
+    const stream = collectingStream(chunks(new Uint8Array(2), new Uint8Array(2)), 10, 4, 'file')
+    await collect(stream.data)
+    expect(stream.collected() && [...stream.collected()!]).toEqual([0, 0, 0, 0])
   })
 
   it('throws AttachmentFailure when the hard cap is crossed mid-stream', async () => {

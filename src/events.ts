@@ -98,11 +98,20 @@ function postAttachments(content: Record<string, unknown>): InboundAttachment[] 
     for (const node of paragraph) {
       if (node === null || typeof node !== 'object' || Array.isArray(node)) continue
       const element = node as Record<string, unknown>
-      if (element.tag !== 'img') continue
-      const key = stringValue(element.image_key)
-      if (key === undefined || seen.has(key)) continue
-      seen.add(key)
-      attachments.push({ type: 'image', kind: 'image', key })
+      if (element.tag === 'img') {
+        const key = stringValue(element.image_key)
+        if (key === undefined || seen.has(key)) continue
+        seen.add(key)
+        attachments.push({ type: 'image', kind: 'image', key })
+        continue
+      }
+      if (element.tag === 'media') {
+        const key = stringValue(element.file_key)
+        if (key === undefined || seen.has(key)) continue
+        seen.add(key)
+        const name = stringValue(element.file_name)
+        attachments.push({ type: 'file', kind: 'media', key, ...(name === undefined ? {} : { name }) })
+      }
     }
   }
   return attachments

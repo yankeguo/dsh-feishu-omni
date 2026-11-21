@@ -1,3 +1,4 @@
+import type { FeishuFileType } from './attachments.ts'
 import type { AssistantCardOptions } from './card.ts'
 import type { FeishuMessageEvent } from './events.ts'
 import type { ConnectionPhase, SessionOption } from './public.ts'
@@ -26,17 +27,10 @@ export interface StateStore {
   update(mutator: (current: PersistedState) => PersistedState): Promise<PersistedState>
 }
 
-/** Host prompt content part mirrored from the DSH Session Controller face. */
-export type PromptContentPart =
-  | { readonly type: 'text'; readonly text: string }
-  /** Opaque DSH upload receipt; the Host resolves it to an ImageBlock or FileBlock. */
-  | { readonly type: 'file'; readonly receiptId: string }
-
 /** One staged prompt attachment produced before prompt admission. */
 export interface PromptAttachment {
+  /** Opaque DSH upload receipt; the Host resolves it to an ImageBlock or FileBlock. */
   readonly receiptId: string
-  /** Only used for the placeholder text and log lines; the Host decides the block type. */
-  readonly kind: 'image' | 'file'
 }
 
 export interface PromptInput {
@@ -58,6 +52,8 @@ export type FeishuResourceType = 'image' | 'file'
 export interface DownloadedResource {
   readonly head: Uint8Array
   readonly data: AsyncIterable<Uint8Array>
+  /** Provider-declared size from `Content-Length`, when the response exposes it. */
+  readonly size?: number
   /** Release the underlying HTTP stream if `data` will not be consumed. */
   cancel(): Promise<void>
 }
@@ -135,7 +131,7 @@ export interface FeishuGateway {
   /** Upload image bytes for a `msg_type=image` message; resolves the `image_key`. */
   uploadImage(bytes: Uint8Array, signal?: AbortSignal): Promise<string>
   /** Upload file bytes for a `msg_type=file` message; resolves the `file_key`. */
-  uploadFile(bytes: Uint8Array, name: string, fileType: string, signal?: AbortSignal): Promise<string>
+  uploadFile(bytes: Uint8Array, name: string, fileType: FeishuFileType, signal?: AbortSignal): Promise<string>
   /** Send an `image_key` previously returned by {@link uploadImage}. */
   sendImage(chatId: string, imageKey: string, uuid: string, signal?: AbortSignal): Promise<void>
   /** Send a `file_key` previously returned by {@link uploadFile}. */

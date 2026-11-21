@@ -6,7 +6,10 @@ import { OmniController } from '../src/controller.ts'
 import { dispatchManagement } from '../src/management.ts'
 import { emptyState, FileStateStore, MemoryStateStore } from '../src/state.ts'
 import type { GatewayCallbacks } from '../src/types.ts'
-import { FakeCredentials, FakeGateway, FakeSessions, SESSION } from './helpers.ts'
+import {
+  assistantEvent, FakeCredentials, FakeGateway, FakeSessions, PNG_BYTES, presentedEvent, SESSION, turnEnd,
+  workingDirectoryChange,
+} from './helpers.ts'
 
 const directories: string[] = []
 afterEach(async () => {
@@ -203,5 +206,70 @@ describe('OmniController', () => {
     expect(JSON.stringify(status)).not.toHaveProperty('appSecret')
     expect(status.lastError?.message).not.toContain('secret-fixture')
     expect(logs.join('\n')).not.toContain('secret-fixture')
+  })
+})
+
+describe('OmniController session cwd forwarding', () => {
+  const binding = {
+    openId: 'ou_alice', chatId: 'oc_alice', label: 'Alice', createdAt: '2026-01-01', updatedAt: '2026-01-01',
+  }
+
+  async function connected() {
+    const initial = {
+      ...emptyState(), appId: 'cli_0123456789abcdef', sessionId: SESSION.sessionId, bindings: [binding],
+    }
+    const harness = setup(initial)
+    harness.credentials.secret = 'secret-fixture'
+    await harness.controller.initialize()
+    await harness.controller.connect()
+    harness.callbacks[0]?.onPhase('connected')
+    // Simulate the global session/event listener passing the Session header cwd.
+    harness.controller.sessionEvent(SESSION.sessionId, assistantEvent(1, 'done', 1), undefined)
+    return harness
+  }
+
+  it('resolves a relative present path against the header cwd passed by the event observer', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'dfo-controller-cwd-'))
+    directories.push(directory)
+    await writeFile(join(directory, 'report.pdf'), '%PDF-1.7 fixture')
+    const { controller, gateways } = await connected()
+    controller.sessionEvent(SESSION.sessionId, {
+      seq: 2, type: 'deliverables/presented', data: { turn: 1, callId: 'call-1', files: [{ path: 'report.pdf' }] },
+    }, directory)
+    controller.sessionEvent(SESSION.sessionId, turnEnd(3, 1))
+    await controller.drain()
+    expect(gateways[0]?.uploadedFileRequests[0]?.name).toBe('report.pdf')
+    expect(gateways[0]?.files).toHaveLength(1)
+  })
+
+  it('follows working-directory/change events for later relative paths', async () => {
+    const first = await mkdtemp(join(tmpdir(), 'dfo-controller-cwd-a-'))
+    const second = await mkdtemp(join(tmpdir(), 'dfo-controller-cwd-b-'))
+    directories.push(first, second)
+    await writeFile(join(second, 'later.txt'), 'later')
+    const { controller, gateways } = await connected()
+    controller.sessionEvent(SESSION.sessionId, workingDirectoryChange(2, second), first)
+    controller.sessionEvent(SESSION.sessionId, presentedEvent(3, 1, [{ path: 'later.txt' }]), first)
+    controller.sessionEvent(SESSION.sessionId, turnEnd(4, 1))
+    await controller.drain()
+    expect(gateways[0]?.uploadedFileRequests[0]?.name).toBe('later.txt')
+  })
+
+  it('resolves relative inline card images with the forwarded cwd', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'dfo-controller-inline-'))
+    directories.push(directory)
+    await writeFile(join(directory, 'chart.png'), PNG_BYTES)
+    const initial = {
+      ...emptyState(), appId: 'cli_0123456789abcdef', sessionId: SESSION.sessionId, bindings: [binding],
+    }
+    const { controller, gateways, credentials, callbacks } = setup(initial)
+    credentials.secret = 'secret-fixture'
+    await controller.initialize()
+    await controller.connect()
+    callbacks[0]?.onPhase('connected')
+    controller.sessionEvent(SESSION.sessionId, assistantEvent(1, '![图](chart.png)', 1), directory)
+    controller.sessionEvent(SESSION.sessionId, turnEnd(2, 1), directory)
+    await controller.drain()
+    expect(gateways[0]?.cards[0]?.markdown).toBe('![图](img_key_1)')
   })
 })

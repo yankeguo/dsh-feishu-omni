@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Feishu shared Session",
-    "description": "Reuse one existing DSH Session across Feishu users and synchronize human inputs and final assistant replies. Includes App ID/App Secret setup, Session binding, long-connection status, and test messages."
+    "description": "Reuse one existing DSH Session across Feishu users and synchronize human inputs and final assistant replies. Supports bidirectional text, images, and files (native ImageBlock/FileBlock and present deliverables), plus App ID/App Secret setup, Session binding, long-connection status, and test messages."
   }
 }

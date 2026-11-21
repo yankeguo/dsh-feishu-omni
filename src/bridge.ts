@@ -1,13 +1,20 @@
 import { createHash } from 'node:crypto'
-import { assistantCardTitle, assistantFallbackText, splitAssistantMarkdown } from './card.ts'
+import { open, readFile, stat } from 'node:fs/promises'
+import { basename, isAbsolute, normalize, resolve } from 'node:path'
+import {
+  assistantCardTitle, assistantFallbackText, closesFence, openingFence, splitAssistantMarkdown,
+  type FenceInfo,
+} from './card.ts'
 import {
   AttachmentFailure, FEISHU_FILE_MAX_BYTES, FEISHU_IMAGE_MAX_BYTES, INBOUND_FILE_MAX_BYTES,
   INBOUND_IMAGE_MAX_BYTES, collectingStream, feishuFileType, formatBytes, imageMediaType,
   mediaTypeExtension, readAllBounded, unsupportedImageFormat, type FeishuFileType,
+  type SupportedImageMediaType,
 } from './attachments.ts'
 import {
-  attachmentRejectionReason, deliveryFailureKind, isRetryable, isRetryableDelivery, reactionFailureDetail,
-  reactionFailureKind, safeMessage, silentLogger, type Logger, type ReactionFailureKind,
+  attachmentRejectionReason, deliveryFailureKind, httpStatusOf, isRetryable, isRetryableDelivery,
+  providerFailureDetail, reactionFailureDetail, reactionFailureKind, safeMessage, silentLogger,
+  type Logger, type ReactionFailureKind,
 } from './errors.ts'
 import { extractInboundMessage, type FeishuMessageEvent, type InboundAttachment, type InboundMessage } from './events.ts'
 import type { TestResult } from './public.ts'
@@ -30,6 +37,15 @@ const DEFAULT_ACK_TIMEOUT_MS = 5_000
 const DEFAULT_ATTACHMENT_TIMEOUT_MS = 120_000
 /** Longest display name kept for prompt placeholders and Feishu uploads. */
 const MAX_DISPLAY_NAME_LENGTH = 120
+/** One inbound message may carry at most this many attachments (matches DSH's 20-image prompt cap). */
+const MAX_INBOUND_ATTACHMENTS = 20
+/**
+ * Per-message budget for the raw mirror copies kept after staging. The copies
+ * exist only to re-upload to other bound chats; past this budget the mirror
+ * falls back to DSH-normalized images or placeholder text instead of retaining
+ * tens of megabytes of raw bytes.
+ */
+const MAX_INBOUND_MIRROR_BYTES = 60 * 1024 * 1024
 
 /**
  * Feishu prompts carry their origin chat in the request id:
@@ -89,7 +105,10 @@ function displayName(name: string | undefined, fallback: string): string {
   const trimmed = name?.trim() ?? ''
   const cleaned = trimmed.replace(/[\p{Cc}/\\]+/gu, ' ').replace(/\s{2,}/g, ' ').trim()
   const chosen = cleaned.length > 0 ? cleaned : fallback
-  return chosen.length > MAX_DISPLAY_NAME_LENGTH ? chosen.slice(0, MAX_DISPLAY_NAME_LENGTH) : chosen
+  // Truncate by code point so a display name can never end in a lone surrogate.
+  return chosen.length > MAX_DISPLAY_NAME_LENGTH
+    ? [...chosen].slice(0, MAX_DISPLAY_NAME_LENGTH).join('')
+    : chosen
 }
 
 /** Fallback display name per inbound attachment kind; never used as a path. */
@@ -161,14 +180,152 @@ async function* oneChunk(bytes: Uint8Array): AsyncIterable<Uint8Array> {
   yield bytes
 }
 
+/**
+ * Find an AttachmentFailure inside a wrapped provider/DSH error chain. The DSH
+ * file-upload service wraps non-Remote errors as `gateway/internal` with a
+ * `cause`, and a stream abort inside the generator can arrive nested.
+ */
+function unwrapAttachmentFailure(error: unknown): AttachmentFailure | undefined {
+  let current: unknown = error
+  for (let depth = 0; depth < 4; depth += 1) {
+    if (current instanceof AttachmentFailure) return current
+    if (typeof current !== 'object' || current === null || !('cause' in current)) return undefined
+    current = (current as { readonly cause?: unknown }).cause
+  }
+  return undefined
+}
+
 /** Normalize any gateway/service failure into a classified attachment failure. */
 function asAttachmentFailure(
   error: unknown,
   reason: 'download' | 'upload',
   message: string,
 ): AttachmentFailure {
-  return error instanceof AttachmentFailure ? error : new AttachmentFailure(message, reason, { cause: error })
+  const nested = unwrapAttachmentFailure(error)
+  if (nested !== undefined) return nested
+  const rejection = attachmentRejectionReason(error)
+  if (rejection === 'IMAGE_TOO_LARGE' || rejection === 'FILE_TOO_LARGE') {
+    return new AttachmentFailure('Feishu attachment exceeds the DSH admission limit', 'too-large', { cause: error })
+  }
+  if (rejection === 'UNSUPPORTED_IMAGE_TYPE') {
+    return new AttachmentFailure('Feishu image type is not accepted by DSH', 'unsupported-image', { cause: error })
+  }
+  return new AttachmentFailure(message, reason, { cause: error })
 }
+
+/** Upper bound for the presented-file buffer of one turn; present itself caps a call at 8. */
+const MAX_PRESENTED_FILES = 32
+/** Never read a deliverable larger than this while preparing an outbound message. */
+const MAX_DELIVERABLE_READ_BYTES = 50 * 1024 * 1024
+/** Image reference inside assistant Markdown: `![alt](<path with spaces>)`. */
+const MARKDOWN_IMAGE_REF = /!\[([^\]\n]*)\]\(\s*(<[^>\n]*>|[^)\n]+?)\s*\)/g
+/** Paths that are never local attachment files. */
+const NON_PATH_TARGET = /^(?:[a-z][a-z0-9+.-]*:|#)/i
+/** An image handled by Feishu itself (already-uploaded image_key). */
+const IMAGE_KEY_TARGET = /^img_[A-Za-z0-9_-]+$/
+/** Inline code span: one or more backticks, content, the same backtick run. */
+const INLINE_CODE = /(`+)[\s\S]*?\1/g
+
+/** One file declared by the `present` tool. */
+interface PresentedFile {
+  readonly path: string
+  readonly description?: string
+}
+
+interface PresentedBatch {
+  readonly turn: number
+  readonly files: readonly PresentedFile[]
+}
+
+function presentedFileOf(value: unknown): PresentedFile | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
+  const row = value as { readonly path?: unknown; readonly description?: unknown }
+  if (typeof row.path !== 'string' || row.path.trim().length === 0) return undefined
+  return {
+    path: row.path,
+    ...(typeof row.description === 'string' ? { description: row.description } : {}),
+  }
+}
+
+/** Validate one `deliverables/presented` event payload. */
+function presentedBatchOf(data: unknown): PresentedBatch | undefined {
+  if (typeof data !== 'object' || data === null) return undefined
+  const row = data as { readonly turn?: unknown; readonly files?: unknown }
+  if (typeof row.turn !== 'number' || !Number.isSafeInteger(row.turn) || row.turn < 0) return undefined
+  if (!Array.isArray(row.files)) return undefined
+  const files: PresentedFile[] = []
+  for (const value of row.files) {
+    const file = presentedFileOf(value)
+    if (file !== undefined) files.push(file)
+  }
+  if (files.length === 0) return undefined
+  return { turn: row.turn, files }
+}
+
+/**
+ * Display name for one deliverable: basename only, never a local path. Long
+ * names are truncated in the stem so the extension survives; Feishu documents
+ * that `file_name` must carry a suffix.
+ */
+function deliverableName(path: string): string {
+  const cleaned = basename(path).replace(/[\p{Cc}]+/gu, ' ').trim()
+  const chosen = cleaned.length > 0 ? cleaned : 'file.bin'
+  if (chosen.length <= MAX_DISPLAY_NAME_LENGTH) return chosen
+  const dot = chosen.lastIndexOf('.')
+  const extension = dot > 0 && chosen.length - dot <= 16 ? chosen.slice(dot) : ''
+  const stem = extension === '' ? chosen : chosen.slice(0, dot)
+  const budget = Math.max(1, MAX_DISPLAY_NAME_LENGTH - extension.length)
+  return `${[...stem].slice(0, budget).join('')}${extension}`
+}
+
+/** Ensure a Feishu upload name carries an extension (a documented requirement). */
+function uploadFileName(name: string): string {
+  const dot = name.lastIndexOf('.')
+  return dot > 0 && dot < name.length - 1 ? name : `${name}.bin`
+}
+
+/** Log-safe fs failure marker: the error code only, never the absolute path. */
+function fileErrorCode(error: unknown): string {
+  if (typeof error === 'object' && error !== null && typeof (error as { code?: unknown }).code === 'string') {
+    return (error as { code: string }).code
+  }
+  return 'unknown error'
+}
+
+/** Blank out inline code spans while preserving string length and offsets. */
+function maskInlineCode(line: string): string {
+  if (!line.includes('`')) return line
+  return line.replace(INLINE_CODE, match => ' '.repeat(match.length))
+}
+
+/** Strip Markdown `<...>` destination brackets. */
+function stripAngle(target: string): string {
+  const trimmed = target.trim()
+  return trimmed.startsWith('<') && trimmed.endsWith('>') ? trimmed.slice(1, -1).trim() : trimmed
+}
+
+/** Read only the leading bytes of a file, for format sniffing before a full read. */
+async function readFileHead(path: string, bytes: number): Promise<Uint8Array> {
+  const handle = await open(path, 'r')
+  try {
+    const buffer = Buffer.alloc(bytes)
+    const result = await handle.read(buffer, 0, bytes, 0)
+    return buffer.subarray(0, result.bytesRead)
+  } finally {
+    await handle.close()
+  }
+}
+
+/** One prepared outbound deliverable, uploaded once and shared by every recipient. */
+type PreparedDeliverable =
+  | { readonly kind: 'image'; readonly key: string; readonly name: string; readonly size: number }
+  | { readonly kind: 'file'; readonly key: string; readonly name: string; readonly size: number }
+  | {
+    readonly kind: 'degraded'
+    readonly name: string
+    readonly size?: number
+    readonly reason: string
+  }
 
 export interface OmniBridgeOptions {
   readonly state: StateStore
@@ -186,6 +343,8 @@ export interface OmniBridgeOptions {
   readonly fileUploads?: FileUploadPort
   /** DSH attachment store used to normalize oversize outbound images. */
   readonly attachments?: AttachmentPort
+  /** Latest known working directory for one Session, used to resolve relative paths. */
+  readonly sessionCwd?: (sessionId: string) => string | undefined
 }
 
 /** One connected bot bound to one existing DSH Session and many direct chats. */
@@ -199,6 +358,10 @@ export class OmniBridge {
   private readonly sessionEventKeys = new Set<string>()
   private readonly sessionEventOrder: string[] = []
   private readonly pendingAssistant = new Map<number, string>()
+  /** Presented files buffered per turn until that turn ends. */
+  private readonly pendingPresented = new Map<number, PresentedFile[]>()
+  /** Last cwd resolved by fallback `SessionPort.list`, keyed by Session. */
+  private readonly cwdCache = new Map<string, string>()
   private readonly lifecycle = new AbortController()
   private readonly operationTimeoutMs: number
   private readonly ackTimeoutMs: number
@@ -362,16 +525,24 @@ export class OmniBridge {
     if (uploads === undefined) {
       throw new AttachmentFailure('DSH attachment upload service is unavailable', 'upload')
     }
+    if (message.attachments.length > MAX_INBOUND_ATTACHMENTS) {
+      throw new AttachmentFailure(
+        `Feishu message carried ${message.attachments.length} attachments (limit ${MAX_INBOUND_ATTACHMENTS})`,
+        'too-many',
+      )
+    }
     const prompt: PromptAttachment[] = []
     const mirrors: StagedMirror[] = []
+    // One shared budget bounds the raw bytes retained for the mirror fan-out.
+    const mirrorBudget = { remaining: MAX_INBOUND_MIRROR_BYTES }
     for (const attachment of message.attachments) {
       if (attachment.type === 'image') {
-        const staged = await this.stageInboundImage(message, attachment, sessionId, uploads)
-        prompt.push({ receiptId: staged.receiptId, kind: 'image' })
+        const staged = await this.stageInboundImage(message, attachment, sessionId, uploads, mirrorBudget)
+        prompt.push({ receiptId: staged.receiptId })
         mirrors.push(staged.mirror)
       } else {
-        const staged = await this.stageInboundFile(message, attachment, sessionId, uploads)
-        prompt.push({ receiptId: staged.receiptId, kind: 'file' })
+        const staged = await this.stageInboundFile(message, attachment, sessionId, uploads, mirrorBudget)
+        prompt.push({ receiptId: staged.receiptId })
         mirrors.push(staged.mirror)
       }
     }
@@ -383,6 +554,7 @@ export class OmniBridge {
     attachment: InboundAttachment,
     sessionId: string,
     uploads: FileUploadPort,
+    mirrorBudget: { remaining: number },
   ): Promise<{ receiptId: string; mirror: StagedMirror }> {
     const signal = this.attachmentSignal()
     let download: DownloadedResource
@@ -394,6 +566,26 @@ export class OmniBridge {
     } catch (error) {
       throw asAttachmentFailure(error, 'download', 'Feishu image resource download failed')
     }
+    // Content-Length and the sniffable head let an unsupported/oversize image
+    // fail before any body byte is buffered.
+    if (download.size !== undefined && download.size > INBOUND_IMAGE_MAX_BYTES) {
+      await download.cancel()
+      throw new AttachmentFailure('Feishu image exceeds the inbound byte bound', 'too-large')
+    }
+    if (download.head.byteLength === 0) {
+      await download.cancel()
+      throw new AttachmentFailure('Feishu image resource is empty', 'download')
+    }
+    const headMediaType = imageMediaType(download.head)
+    if (headMediaType === undefined) {
+      await download.cancel()
+      const format = unsupportedImageFormat(download.head)
+      throw new AttachmentFailure(
+        'Feishu image uses a format DSH cannot prompt',
+        'unsupported-image',
+        { detail: format ?? 'unknown' },
+      )
+    }
     let bytes: Uint8Array
     try {
       bytes = await this.bounded(
@@ -403,16 +595,7 @@ export class OmniBridge {
     } catch (error) {
       throw asAttachmentFailure(error, 'download', 'Feishu image resource download failed')
     }
-    if (bytes.byteLength === 0) throw new AttachmentFailure('Feishu image resource is empty', 'download')
-    const mediaType = imageMediaType(bytes)
-    if (mediaType === undefined) {
-      const format = unsupportedImageFormat(bytes)
-      throw new AttachmentFailure(
-        'Feishu image uses a format DSH cannot prompt',
-        'unsupported-image',
-        { detail: format ?? 'unknown' },
-      )
-    }
+    const mediaType = imageMediaType(bytes) ?? headMediaType
     let staged: StagedUpload
     try {
       staged = await this.bounded(
@@ -428,12 +611,16 @@ export class OmniBridge {
     } catch (error) {
       throw asAttachmentFailure(error, 'upload', 'DSH attachment staging failed')
     }
+    // Only a copy that Feishu can accept as-is is worth retaining for the
+    // mirror; larger images fall back to the DSH-normalized prompt copy.
+    const keepBytes = bytes.byteLength <= FEISHU_IMAGE_MAX_BYTES && bytes.byteLength <= mirrorBudget.remaining
+    if (keepBytes) mirrorBudget.remaining -= bytes.byteLength
     return {
       receiptId: staged.receiptId,
       mirror: {
         attachment,
         placeholder: mirrorPlaceholder(attachment),
-        bytes,
+        ...(keepBytes ? { bytes } : {}),
         ...(staged.image === undefined ? {} : { imageRef: staged.image }),
       },
     }
@@ -444,6 +631,7 @@ export class OmniBridge {
     attachment: InboundAttachment,
     sessionId: string,
     uploads: FileUploadPort,
+    mirrorBudget: { remaining: number },
   ): Promise<{ receiptId: string; mirror: StagedMirror }> {
     const signal = this.attachmentSignal()
     let download: DownloadedResource
@@ -455,9 +643,15 @@ export class OmniBridge {
     } catch (error) {
       throw asAttachmentFailure(error, 'download', 'Feishu file resource download failed')
     }
+    if (download.size !== undefined && download.size > INBOUND_FILE_MAX_BYTES) {
+      await download.cancel()
+      throw new AttachmentFailure('Feishu file exceeds the inbound byte bound', 'too-large')
+    }
     const fileName = inboundFileName(attachment)
+    // Retain a mirror copy only while the per-message budget allows it.
+    const collectBytes = Math.max(0, Math.min(FEISHU_FILE_MAX_BYTES, mirrorBudget.remaining))
     const collector = collectingStream(
-      download.data, INBOUND_FILE_MAX_BYTES, FEISHU_FILE_MAX_BYTES, 'file',
+      download.data, INBOUND_FILE_MAX_BYTES, collectBytes, 'file',
     )
     let receiptId: string
     try {
@@ -472,6 +666,7 @@ export class OmniBridge {
       throw asAttachmentFailure(error, 'upload', 'DSH attachment staging failed')
     }
     const bytes = collector.collected()
+    if (bytes !== undefined) mirrorBudget.remaining -= bytes.byteLength
     return {
       receiptId,
       mirror: {
@@ -493,8 +688,14 @@ export class OmniBridge {
     error: unknown,
     keys: readonly string[],
   ): Promise<void> {
+    // An abort caused by shutdown/stop is not a terminal payload failure: keep
+    // the dedupe keys unwritten so a redelivery after restart can retry.
+    if (this.stopped) return
     const notice = this.degradationNotice(error)
-    this.logger.warn(`Feishu inbound attachment degraded: ${safeMessage(error)}`)
+    const cause = error instanceof AttachmentFailure && error.cause !== undefined ? error.cause : error
+    this.logger.warn(
+      `Feishu inbound attachment degraded: ${safeMessage(error)} (${providerFailureDetail(cause)})`,
+    )
     try {
       await this.sendWithRetry(message.chatId, `[Feishu Omni] ${notice}`, uuidFor(`degrade:${message.messageId}`))
     } catch {
@@ -506,18 +707,38 @@ export class OmniBridge {
   /** User-facing reason for one refused inbound attachment. */
   private degradationNotice(error: unknown): string {
     if (error instanceof AttachmentFailure) {
+      // The 120s staging bound surfaces as the wrapper's timeout, whichever
+      // phase (download or DSH write) hit it.
+      if (error.cause instanceof Error && error.cause.message.includes('timed out')) {
+        return '附件处理超时，未投递到 Session，请稍后重试。'
+      }
       switch (error.reason) {
         case 'unsupported-image': {
           const format = error.detail === undefined || error.detail === 'unknown'
             ? ''
-            : `${error.detail.toUpperCase()} `
-          return `图片格式${format ? ` ${format.trim()}` : ''}暂不支持，支持 PNG/JPEG/WEBP/GIF；HEIC/BMP/TIFF 请先转成 PNG/JPEG 后重新发送。`
+            : ` ${error.detail.toUpperCase()} `
+          return `图片格式${format}暂不支持，支持 PNG/JPEG/WEBP/GIF${format.trim() ? `；${format.trim()} 请先转成 PNG/JPEG` : ''}后重新发送。`
         }
         case 'too-large':
           return `附件超过大小限制（图片 ≤${formatBytes(INBOUND_IMAGE_MAX_BYTES)}，文件 ≤${formatBytes(INBOUND_FILE_MAX_BYTES)}），未投递到 Session。`
-        case 'download':
+        case 'download': {
+          // A missing download scope is fixed in the Feishu console, not by retrying.
+          const kind = reactionFailureKind(error.cause)
+          if (kind === 'permission') {
+            return '机器人缺少读取消息附件的权限（im:message:readonly / im:message.history:readonly 等），'
+              + '请管理员在飞书开放平台授权并发布新应用版本后重试。'
+          }
+          if (kind === 'rate-limit') {
+            return '附件下载触发了飞书限频，未投递到 Session，请稍后重试。'
+          }
+          const status = httpStatusOf(error.cause)
+          if (status !== undefined && status >= 400 && status < 500) {
+            return '附件下载失败（资源可能超过 100 MB，或该消息类型不支持下载），未投递到 Session。'
+          }
           return '附件下载失败，未投递到 Session，请稍后重试。'
-        case 'normalize':
+        }
+        case 'too-many':
+          return `单条消息附件过多（上限 ${MAX_INBOUND_ATTACHMENTS} 个），未投递到 Session。`
         case 'upload':
           return '附件无法写入 DSH 附件服务，未投递到 Session，请稍后重试或改发文字。'
       }
@@ -546,28 +767,61 @@ export class OmniBridge {
       const resource = await this.uploadMirrorResource(mirror)
       for (const binding of recipients) {
         const uuid = uuidFor(`attach:${message.messageId}:${binding.chatId}:${index}`)
-        try {
-          if (resource.kind === 'image') {
-            await this.bounded(
-              () => this.options.gateway.sendImage(binding.chatId, resource.key, uuid, this.attachmentSignal()),
-              this.attachmentTimeoutMs,
-            )
-          } else if (resource.kind === 'file') {
-            await this.bounded(
-              () => this.options.gateway.sendFile(binding.chatId, resource.key, uuid, this.attachmentSignal()),
-              this.attachmentTimeoutMs,
-            )
-          } else {
-            // Placeholder text is best-effort like every other mirror write: a
-            // failure must not reach Settings' connection error or block peers.
-            await this.bounded(() => this.options.gateway.sendText(
-              binding.chatId, mirror.placeholder, uuid, this.attachmentSignal(),
-            ), this.attachmentTimeoutMs)
-          }
-        } catch (error) {
-          this.logger.warn(`Feishu attachment mirror delivery failed: ${safeMessage(error)}`)
-        }
+        await this.sendMirrorAttachment(binding.chatId, resource, mirror.placeholder, uuid)
       }
+    }
+  }
+
+  /**
+   * Send one mirrored attachment to one chat. Transient failures retry like the
+   * text path; after that the recipient gets the placeholder text with the same
+   * UUID (idempotent if the attachment actually landed). Mirror failures stay
+   * out of Settings' connection error and never block other recipients.
+   */
+  private async sendMirrorAttachment(
+    chatId: string,
+    resource: MirrorResource,
+    placeholder: string,
+    uuid: string,
+  ): Promise<void> {
+    try {
+      if (resource.kind === 'image') {
+        await this.retryOperation(
+          () => this.options.gateway.sendImage(chatId, resource.key, uuid, this.attachmentSignal()),
+        )
+      } else if (resource.kind === 'file') {
+        await this.retryOperation(
+          () => this.options.gateway.sendFile(chatId, resource.key, uuid, this.attachmentSignal()),
+        )
+      } else {
+        await this.retryOperation(
+          () => this.options.gateway.sendText(chatId, placeholder, uuid, this.attachmentSignal()),
+        )
+      }
+      return
+    } catch (error) {
+      if (this.stopped) return
+      this.logger.warn(`Feishu attachment mirror delivery failed: ${safeMessage(error)}`)
+      if (resource.kind === 'placeholder') return
+      // Same UUID: Feishu's idempotency suppresses a duplicate text when the
+      // attachment actually landed but its response was lost.
+      try {
+        await this.retryOperation(
+          () => this.options.gateway.sendText(chatId, placeholder, uuid, this.attachmentSignal()),
+        )
+      } catch (fallbackError) {
+        this.logger.warn(`Feishu attachment mirror placeholder failed: ${safeMessage(fallbackError)}`)
+      }
+    }
+  }
+
+  /** Retry transient Feishu mirror uploads, returning undefined when they fail. */
+  private async uploadMirrorWithRetry(operation: () => Promise<string>): Promise<string | undefined> {
+    try {
+      return await this.retryOperation(operation)
+    } catch (error) {
+      if (!this.stopped) this.logger.warn(`Feishu attachment mirror upload failed: ${safeMessage(error)}`)
+      return undefined
     }
   }
 
@@ -575,15 +829,11 @@ export class OmniBridge {
   private async uploadMirrorResource(mirror: StagedMirror): Promise<MirrorResource> {
     if (mirror.attachment.type === 'image') {
       if (mirror.bytes !== undefined && mirror.bytes.byteLength <= FEISHU_IMAGE_MAX_BYTES) {
-        try {
-          const key = await this.bounded(
-            () => this.options.gateway.uploadImage(mirror.bytes as Uint8Array, this.attachmentSignal()),
-            this.attachmentTimeoutMs,
-          )
-          return { kind: 'image', key }
-        } catch (error) {
-          this.logger.warn(`Feishu image mirror upload failed: ${safeMessage(error)}`)
-        }
+        const kept = mirror.bytes as Uint8Array
+        const key = await this.uploadMirrorWithRetry(
+          () => this.options.gateway.uploadImage(kept, this.attachmentSignal()),
+        )
+        if (key !== undefined) return { kind: 'image', key }
       }
       // Oversize raw images: DSH already normalized the prompt copy; re-upload
       // that bounded form instead of inventing another image pipeline.
@@ -593,13 +843,13 @@ export class OmniBridge {
             () => (this.attachments as AttachmentPort).readImage(mirror.imageRef, this.attachmentSignal()),
             this.attachmentTimeoutMs,
           )
-          if (stored.data.byteLength > 0 && stored.data.byteLength <= FEISHU_IMAGE_MAX_BYTES
-            && imageMediaType(stored.data) !== undefined) {
-            const key = await this.bounded(
-              () => this.options.gateway.uploadImage(stored.data, this.attachmentSignal()),
-              this.attachmentTimeoutMs,
+          const normalized = stored.data
+          if (normalized.byteLength > 0 && normalized.byteLength <= FEISHU_IMAGE_MAX_BYTES
+            && imageMediaType(normalized) !== undefined) {
+            const key = await this.uploadMirrorWithRetry(
+              () => this.options.gateway.uploadImage(normalized, this.attachmentSignal()),
             )
-            return { kind: 'image', key }
+            if (key !== undefined) return { kind: 'image', key }
           }
         } catch (error) {
           this.logger.warn(`Feishu normalized image mirror upload failed: ${safeMessage(error)}`)
@@ -608,21 +858,12 @@ export class OmniBridge {
       return { kind: 'placeholder' }
     }
     if (mirror.bytes === undefined || mirror.fileName === undefined) return { kind: 'placeholder' }
-    try {
-      const key = await this.bounded(
-        () => this.options.gateway.uploadFile(
-          mirror.bytes as Uint8Array,
-          mirror.fileName as string,
-          mirror.fileType ?? 'stream',
-          this.attachmentSignal(),
-        ),
-        this.attachmentTimeoutMs,
-      )
-      return { kind: 'file', key }
-    } catch (error) {
-      this.logger.warn(`Feishu file mirror upload failed: ${safeMessage(error)}`)
-      return { kind: 'placeholder' }
-    }
+    const bytes = mirror.bytes as Uint8Array
+    const fileName = mirror.fileName as string
+    const key = await this.uploadMirrorWithRetry(
+      () => this.options.gateway.uploadFile(bytes, fileName, mirror.fileType ?? 'stream', this.attachmentSignal()),
+    )
+    return key === undefined ? { kind: 'placeholder' } : { kind: 'file', key }
   }
 
   /**
@@ -674,8 +915,11 @@ export class OmniBridge {
 
   private async processSessionEvent(sessionId: string, event: SessionEventLike): Promise<void> {
     if (sessionId !== this.options.state.snapshot().sessionId) return
-    const supported = event.type === 'user/message' || event.type === 'assistant/message' || event.type === 'turn/end'
-    if (!supported || (event.type !== 'turn/end' && event.surfaceOp !== 'append')) return
+    const supported = event.type === 'user/message' || event.type === 'assistant/message'
+      || event.type === 'turn/end' || event.type === 'deliverables/presented'
+    // Present deliveries are log-only events without a surface operation.
+    const surfaceOptional = event.type === 'turn/end' || event.type === 'deliverables/presented'
+    if (!supported || (!surfaceOptional && event.surfaceOp !== 'append')) return
     const key = `${sessionId}:${event.seq}:${event.type}`
     if (this.sessionEventKeys.has(key)) return
     this.sessionEventKeys.add(key)
@@ -685,6 +929,29 @@ export class OmniBridge {
       if (oldest !== undefined) this.sessionEventKeys.delete(oldest)
     }
 
+    if (event.type === 'deliverables/presented') {
+      const batch = presentedBatchOf(event.data)
+      if (batch === undefined) {
+        this.logger.warn('Ignoring malformed deliverables/presented session event')
+        return
+      }
+      const merged = this.pendingPresented.get(batch.turn) ?? []
+      let truncated = false
+      for (const file of batch.files) {
+        if (merged.length >= MAX_PRESENTED_FILES) {
+          truncated = true
+          break
+        }
+        if (!merged.some(entry => entry.path === file.path)) merged.push(file)
+      }
+      if (truncated) {
+        this.logger.warn(
+          `Feishu deliverable buffer reached its per-turn cap (${MAX_PRESENTED_FILES}); extra files were not delivered`,
+        )
+      }
+      this.pendingPresented.set(batch.turn, merged)
+      return
+    }
     if (event.type === 'assistant/message') {
       const data = event.data as {
         turn?: unknown
@@ -703,11 +970,26 @@ export class OmniBridge {
       if (typeof turn !== 'number') return
       const rawText = this.pendingAssistant.get(turn)
       this.pendingAssistant.delete(turn)
+      const presented = this.pendingPresented.get(turn)
+      this.pendingPresented.delete(turn)
       const reason = typeof data?.reason === 'object' && data.reason !== null
         ? (data.reason as { kind?: unknown }).kind
         : data?.reason
-      // Aborted, failed, blocked and token-truncated turns are not final replies.
-      if (reason === 'completed' && rawText !== undefined) await this.broadcastAssistant(rawText, key)
+      // Aborted, failed, blocked and token-truncated turns are not final replies
+      // and must not deliver a partial turn's files either.
+      if (reason !== 'completed') return
+      // Nobody is bound: skip card/inline-image API traffic entirely.
+      if (this.options.state.snapshot().bindings.length === 0) return
+      // One deterministic rewrite per final reply: inline local images are
+      // uploaded once, then every recipient gets the same chunk/UUID sequence.
+      const markdown = rawText === undefined
+        ? undefined
+        : await this.rewriteInlineImages(rawText, presented, sessionId)
+      if (markdown !== undefined) await this.broadcastAssistant(markdown, key)
+      if (presented !== undefined && presented.length > 0) {
+        // Cards first, then the deliverable attachments, preserving turn order.
+        await this.sendDeliverables(sessionId, presented, key)
+      }
       return
     }
 
@@ -844,6 +1126,348 @@ export class OmniBridge {
       }
     }
     return false
+  }
+
+  /** Resolve one Session working directory, preferring the event-fed value. */
+  private async sessionWorkingDirectory(sessionId: string): Promise<string | undefined> {
+    const provided = this.options.sessionCwd?.(sessionId)
+    if (provided !== undefined && provided.trim()) return provided
+    const cached = this.cwdCache.get(sessionId)
+    if (cached !== undefined) return cached
+    try {
+      // Fallback for a bridge that missed the Session's first events (e.g. after
+      // a reconnect): the controller still lists attached and persisted Sessions.
+      const sessions = await this.bounded(() => this.options.sessions.list(this.lifecycle.signal))
+      const cwd = sessions.find(session => session.sessionId === sessionId)?.cwd ?? undefined
+      if (cwd !== undefined && cwd.trim()) this.cwdCache.set(sessionId, cwd)
+      return cwd
+    } catch {
+      return undefined
+    }
+  }
+
+  /** Resolve one absolute or cwd-relative local path. */
+  private resolveLocalPath(rawPath: string, cwd: string | undefined): string | undefined {
+    const trimmed = rawPath.trim()
+    if (!trimmed) return undefined
+    if (isAbsolute(trimmed)) return normalize(trimmed)
+    if (cwd === undefined) return undefined
+    return resolve(cwd, trimmed)
+  }
+
+  /** Upload one local image for inline display inside the assistant card. */
+  private async inlineImageKey(path: string): Promise<string | undefined> {
+    try {
+      const info = await stat(path)
+      if (!info.isFile() || info.size === 0 || info.size > MAX_DELIVERABLE_READ_BYTES) return undefined
+      const head = await readFileHead(path, 64)
+      const mediaType = imageMediaType(head)
+      if (mediaType === undefined) return undefined
+      const bytes = await readFile(path)
+      if (bytes.byteLength <= FEISHU_IMAGE_MAX_BYTES) {
+        try {
+          return await this.bounded(
+            () => this.options.gateway.uploadImage(bytes, this.attachmentSignal()),
+            this.attachmentTimeoutMs,
+          )
+        } catch (error) {
+          // Over-limit or unsupported-dimension images still get one normalized retry.
+          this.logger.warn(`Feishu inline image upload failed, retrying after normalization: ${safeMessage(error)}`)
+        }
+      }
+      const normalized = await this.normalizeOutboundImage(bytes, mediaType)
+      if (normalized === undefined) return undefined
+      return await this.bounded(
+        () => this.options.gateway.uploadImage(normalized, this.attachmentSignal()),
+        this.attachmentTimeoutMs,
+      )
+    } catch (error) {
+      // fs errors embed the absolute path; log only the error code.
+      this.logger.warn(`Feishu inline image rewrite skipped (${fileErrorCode(error)})`)
+      return undefined
+    }
+  }
+
+  /** Resize/normalize one image through DSH's own attachment service. */
+  private async normalizeOutboundImage(bytes: Uint8Array, mediaType: string): Promise<Uint8Array | undefined> {
+    const attachments = this.attachments
+    if (attachments === undefined) return undefined
+    try {
+      const ref = await this.bounded(
+        () => attachments.saveImage({ data: bytes, mediaType }),
+        this.attachmentTimeoutMs,
+      )
+      const stored = await this.bounded(
+        () => attachments.readImage(ref, this.attachmentSignal()),
+        this.attachmentTimeoutMs,
+      )
+      if (stored.data.byteLength === 0 || stored.data.byteLength > FEISHU_IMAGE_MAX_BYTES) return undefined
+      return stored.data
+    } catch (error) {
+      this.logger.warn(`Feishu image normalization failed: ${safeMessage(error)}`)
+      return undefined
+    }
+  }
+
+  /**
+   * Rewrite local Markdown image references in one final assistant reply into
+   * Feishu `image_key`s that the card's markdown element renders inline. Paths
+   * already delivered by `present` are left alone (that path sends a real image
+   * message), as are URLs, `image_key`s, missing files, non-images, code fences
+   * and every upload failure: the original Markdown stays untouched then.
+   */
+  private async rewriteInlineImages(
+    markdown: string,
+    presented: readonly PresentedFile[] | undefined,
+    sessionId: string,
+  ): Promise<string> {
+    if (!markdown.includes('![')) return markdown
+    const lines = markdown.split('\n')
+    const candidates: { readonly line: number; readonly match: RegExpExecArray }[] = []
+    let fence: FenceInfo | undefined
+    for (const [index, line] of lines.entries()) {
+      // Use the card splitter's CommonMark fence rules so code examples are
+      // never rewritten and the two pipelines agree on block boundaries.
+      if (fence !== undefined) {
+        if (closesFence(line, fence)) fence = undefined
+        continue
+      }
+      const opened = openingFence(line)
+      if (opened !== undefined) {
+        fence = opened
+        continue
+      }
+      // Mask inline code spans so `` `![alt](path)` `` examples are not rewritten;
+      // masking keeps offsets aligned with the original line.
+      const masked = maskInlineCode(line)
+      MARKDOWN_IMAGE_REF.lastIndex = 0
+      for (;;) {
+        const match = MARKDOWN_IMAGE_REF.exec(masked)
+        if (match === null) break
+        candidates.push({ line: index, match })
+      }
+    }
+    if (candidates.length === 0) return markdown
+
+    const needsCwd = candidates.some(candidate => !isAbsolute(stripAngle(candidate.match[2] ?? '')))
+      || (presented ?? []).some(file => !isAbsolute(file.path))
+    const cwd = needsCwd ? await this.sessionWorkingDirectory(sessionId) : undefined
+
+    const excluded = new Set<string>()
+    for (const file of presented ?? []) {
+      const resolved = this.resolveLocalPath(file.path, cwd)
+      if (resolved !== undefined) excluded.add(resolved)
+    }
+
+    const keys = new Map<string, string | undefined>()
+    const replacements: { readonly line: number; readonly match: RegExpExecArray; key: string }[] = []
+    for (const candidate of candidates) {
+      const rawTarget = stripAngle(candidate.match[2] ?? '')
+      if (IMAGE_KEY_TARGET.test(rawTarget)) continue
+      const path = isAbsolute(rawTarget)
+        ? normalize(rawTarget)
+        : (NON_PATH_TARGET.test(rawTarget) ? undefined : this.resolveLocalPath(rawTarget, cwd))
+      if (path === undefined || excluded.has(path)) continue
+      let key = keys.get(path)
+      if (key === undefined && !keys.has(path)) {
+        key = await this.inlineImageKey(path)
+        keys.set(path, key)
+      }
+      if (key === undefined) continue
+      replacements.push({ ...candidate, key })
+    }
+    if (replacements.length === 0) return markdown
+
+    const byLine = new Map<number, { readonly match: RegExpExecArray; key: string }[]>()
+    for (const replacement of replacements) {
+      const bucket = byLine.get(replacement.line) ?? []
+      bucket.push(replacement)
+      byLine.set(replacement.line, bucket)
+    }
+    const rebuilt = [...lines]
+    for (const [lineIndex, bucket] of byLine) {
+      let line = rebuilt[lineIndex] ?? ''
+      // Replace from the end so earlier match offsets stay valid.
+      for (const replacement of bucket.reverse()) {
+        const start = replacement.match.index
+        const end = start + replacement.match[0].length
+        // Take the alt text from the original line: the match was computed on a
+        // masked copy where inline code spans were blanked.
+        const alt = /^!\[([^\]\n]*)\]/.exec(line.slice(start))?.[1] ?? replacement.match[1] ?? ''
+        line = `${line.slice(0, start)}![${alt}](${replacement.key})${line.slice(end)}`
+      }
+      rebuilt[lineIndex] = line
+    }
+    return rebuilt.join('\n')
+  }
+
+  /**
+   * Deliver the files declared by `present` for one completed turn: each file is
+   * prepared and uploaded once, then sent to every bound chat with a
+   * deterministic per-chat UUID. Per-chat failures degrade to a text notice and
+   * never block the other chats or files.
+   */
+  private async sendDeliverables(sessionId: string, files: readonly PresentedFile[], key: string): Promise<void> {
+    const bindings = this.options.state.snapshot().bindings
+    if (bindings.length === 0) return
+    let cwd: string | undefined
+    let cwdResolved = false
+    for (const [index, file] of files.entries()) {
+      if (this.stopped) return
+      if (!cwdResolved) {
+        cwdResolved = true
+        cwd = await this.sessionWorkingDirectory(sessionId)
+      }
+      const prepared = await this.prepareDeliverable(file, cwd)
+      for (const binding of bindings) {
+        if (this.stopped) return
+        const uuid = uuidFor(`${key}:${binding.chatId}:deliverable:${index}`)
+        await this.deliverPrepared(binding.chatId, prepared, uuid)
+      }
+    }
+  }
+
+  /** Classify, bound and upload one presented file once for all recipients. */
+  private async prepareDeliverable(file: PresentedFile, cwd: string | undefined): Promise<PreparedDeliverable> {
+    const name = deliverableName(file.path)
+    const path = isAbsolute(file.path) ? normalize(file.path) : this.resolveLocalPath(file.path, cwd)
+    if (path === undefined) return { kind: 'degraded', name, reason: '无法解析相对路径（Session 工作目录未知）' }
+    let info
+    try {
+      info = await stat(path)
+    } catch {
+      return { kind: 'degraded', name, reason: '文件不存在或不可读' }
+    }
+    if (!info.isFile()) return { kind: 'degraded', name, reason: '不是普通文件' }
+    const size = info.size
+    if (size === 0) return { kind: 'degraded', name, size, reason: '文件为空' }
+    if (size > MAX_DELIVERABLE_READ_BYTES) {
+      return { kind: 'degraded', name, size, reason: `附件超过处理上限（图片单文件需 ≤${formatBytes(MAX_DELIVERABLE_READ_BYTES)}，其他文件需 ≤${formatBytes(FEISHU_FILE_MAX_BYTES)}）` }
+    }
+    let head: Uint8Array
+    try {
+      head = await readFileHead(path, 64)
+    } catch (error) {
+      this.logger.warn(`Feishu deliverable read failed (${fileErrorCode(error)})`)
+      return { kind: 'degraded', name, size, reason: '文件读取失败' }
+    }
+    const mediaType = imageMediaType(head)
+    if (mediaType === undefined && size > FEISHU_FILE_MAX_BYTES) {
+      // Sniff first: a large non-image must never be read into memory.
+      return { kind: 'degraded', name, size, reason: `文件超过 ${formatBytes(FEISHU_FILE_MAX_BYTES)} 上限` }
+    }
+    let data: Uint8Array
+    try {
+      data = await readFile(path)
+    } catch (error) {
+      this.logger.warn(`Feishu deliverable read failed (${fileErrorCode(error)})`)
+      return { kind: 'degraded', name, size, reason: '文件读取失败' }
+    }
+    if (mediaType !== undefined) {
+      const imageKey = await this.uploadDeliverableImage(data, mediaType)
+      if (imageKey !== undefined) return { kind: 'image', key: imageKey, name, size }
+      return { kind: 'degraded', name, size, reason: '图片超过飞书限制且无法规范化' }
+    }
+    const uploadName = uploadFileName(name)
+    try {
+      const fileKey = await this.retryOperation(
+        () => this.options.gateway.uploadFile(data, uploadName, feishuFileType(uploadName), this.attachmentSignal()),
+      )
+      return { kind: 'file', key: fileKey, name, size }
+    } catch (error) {
+      this.logger.warn(`Feishu deliverable file upload failed: ${safeMessage(error)}`)
+      return { kind: 'degraded', name, size, reason: '飞书文件上传失败' }
+    }
+  }
+
+  /** Upload one deliverable image, normalizing first when it exceeds the image cap. */
+  private async uploadDeliverableImage(
+    data: Uint8Array,
+    mediaType: SupportedImageMediaType,
+  ): Promise<string | undefined> {
+    if (data.byteLength <= FEISHU_IMAGE_MAX_BYTES) {
+      try {
+        return await this.retryOperation(
+          () => this.options.gateway.uploadImage(data, this.attachmentSignal()),
+        )
+      } catch (error) {
+        this.logger.warn(`Feishu deliverable image upload failed, retrying after normalization: ${safeMessage(error)}`)
+      }
+    }
+    const normalized = await this.normalizeOutboundImage(data, mediaType)
+    if (normalized === undefined) return undefined
+    try {
+      return await this.retryOperation(
+        () => this.options.gateway.uploadImage(normalized, this.attachmentSignal()),
+      )
+    } catch (error) {
+      this.logger.warn(`Feishu normalized deliverable image upload failed: ${safeMessage(error)}`)
+      return undefined
+    }
+  }
+
+  /** Send one prepared deliverable, degrading to text only when it cannot land. */
+  private async deliverPrepared(chatId: string, prepared: PreparedDeliverable, uuid: string): Promise<void> {
+    try {
+      if (prepared.kind === 'image') {
+        await this.retryOperation(
+          () => this.options.gateway.sendImage(chatId, prepared.key, uuid, this.attachmentSignal()),
+        )
+        return
+      }
+      if (prepared.kind === 'file') {
+        await this.retryOperation(
+          () => this.options.gateway.sendFile(chatId, prepared.key, uuid, this.attachmentSignal()),
+        )
+        return
+      }
+      await this.sendDeliverableNotice(chatId, prepared, uuid)
+    } catch (error) {
+      this.logger.warn(`Feishu deliverable delivery failed: ${safeMessage(error)}`)
+      if (prepared.kind === 'degraded') return
+      // Same UUID as the failed attachment: Feishu's idempotency prevents a
+      // duplicate text when the attachment actually landed.
+      await this.sendDeliverableNotice(chatId, {
+        name: prepared.name, size: prepared.size, reason: '发送失败',
+      }, uuid)
+    }
+  }
+
+  /** Tell one chat why a deliverable was not attached, without leaking local paths. */
+  private async sendDeliverableNotice(
+    chatId: string,
+    prepared: { readonly name: string; readonly size?: number; readonly reason: string },
+    uuid: string,
+  ): Promise<void> {
+    const size = prepared.size === undefined ? '' : `（${formatBytes(prepared.size)}）`
+    const text = `[Feishu Omni] 交付物「${prepared.name}」${size}未发送：${prepared.reason}`
+    try {
+      await this.retryOperation(
+        () => this.options.gateway.sendText(chatId, text, uuid, this.attachmentSignal()),
+      )
+    } catch (error) {
+      this.logger.warn(`Feishu deliverable notice failed: ${safeMessage(error)}`)
+    }
+  }
+
+  /**
+   * Retry one bounded external operation on retryable provider failures with the
+   * same deterministic UUID. Used by deliverable upload/send and mirror paths so
+   * a transient rate limit does not turn an attachment into a text notice.
+   */
+  private async retryOperation<T>(operation: () => Promise<T>): Promise<T> {
+    let lastError: unknown
+    for (let attempt = 0; attempt < this.retry.attempts; attempt += 1) {
+      if (this.stopped) throw new Error('Feishu Omni bridge stopped')
+      try {
+        return await this.bounded(operation, this.attachmentTimeoutMs)
+      } catch (error) {
+        lastError = error
+        if (this.stopped || attempt === this.retry.attempts - 1 || !isRetryable(error)) throw error
+        await this.bounded(() => this.sleep(Math.min(this.retry.maxDelayMs, this.retry.baseDelayMs * 2 ** attempt)))
+      }
+    }
+    throw lastError ?? new Error('Feishu Omni operation failed')
   }
 
   /** Bound every external wait and reject immediately when stop aborts it. */

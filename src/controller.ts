@@ -32,6 +32,8 @@ export class OmniController {
   private lastError: PublicError | null = null
   private lastConnectedAt: string | null = null
   private readonly secrets = new Set<string>()
+  /** Last known working directory per Session, fed by the global event observer. */
+  private readonly sessionCwds = new Map<string, string>()
   private closing = false
   private closed = false
   private closePromise: Promise<void> | undefined
@@ -151,8 +153,24 @@ export class OmniController {
     return this.closePromise
   }
 
-  sessionEvent(sessionId: string, event: SessionEventLike): void {
+  /**
+   * Feed one committed Session event to the live bridge and track the Session
+   * working directory: the header `cwd` is the creation directory and
+   * `working-directory/change` events carry the effective directory after `cd`.
+   * Relative Markdown image paths and relative `present` paths resolve against
+   * the latest value.
+   */
+  sessionEvent(sessionId: string, event: SessionEventLike, cwd?: string | undefined): void {
     if (this.closing) return
+    // The Session header cwd is the creation directory: seed it once and let
+    // working-directory/change events own every later update.
+    if (typeof cwd === 'string' && cwd.trim() && !this.sessionCwds.has(sessionId)) {
+      this.sessionCwds.set(sessionId, cwd)
+    }
+    if (event.type === 'working-directory/change') {
+      const data = event.data as { readonly cwd?: unknown } | undefined
+      if (typeof data?.cwd === 'string' && data.cwd.trim()) this.sessionCwds.set(sessionId, data.cwd)
+    }
     const bridge = this.bridge
     if (bridge === undefined) return
     void bridge.sessionEvent(sessionId, event)
@@ -213,6 +231,7 @@ export class OmniController {
         gateway,
         logger: this.logger,
         now: this.now,
+        sessionCwd: id => this.sessionCwds.get(id),
         ...(this.options.fileUploads === undefined ? {} : { fileUploads: this.options.fileUploads }),
         ...(this.options.attachments === undefined ? {} : { attachments: this.options.attachments }),
         onError: error => {
@@ -239,6 +258,7 @@ export class OmniController {
     this.bridge = undefined
     this.generation += 1
     if (bridge !== undefined) await bridge.stop()
+    this.sessionCwds.clear()
     this.phase = this.options.state.snapshot().appId === null ? 'unconfigured' : 'disconnected'
   }
 

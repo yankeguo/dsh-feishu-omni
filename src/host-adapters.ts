@@ -67,11 +67,20 @@ export class DshCredentialPort implements CredentialPort {
  * degrades image/file input instead of failing plugin activation.
  */
 export class DshFileUploadPort implements FileUploadPort {
-  private constructor(private readonly service: FileUploadsService) {}
+  private constructor(private readonly ctx: Context) {}
 
   static from(ctx: Context): DshFileUploadPort | undefined {
-    const service = optionalService<FileUploadsService>(ctx, 'fileUploads')
-    return service === undefined ? undefined : new DshFileUploadPort(service)
+    // Probe once so a missing service degrades input, but resolve at use time so
+    // a provider reload (live plugin management) cannot leave a stale instance.
+    return optionalService<FileUploadsService>(ctx, 'fileUploads') === undefined
+      ? undefined
+      : new DshFileUploadPort(ctx)
+  }
+
+  private service(): FileUploadsService {
+    const service = optionalService<FileUploadsService>(this.ctx, 'fileUploads')
+    if (service === undefined) throw new Error('DSH file upload service is unavailable')
+    return service
   }
 
   async uploadImageStream(request: {
@@ -81,7 +90,7 @@ export class DshFileUploadPort implements FileUploadPort {
     readonly signal?: AbortSignal
     readonly name?: string
   }): Promise<StagedUpload> {
-    const result = await this.service.uploadImageStream({
+    const result = await this.service().uploadImageStream({
       sessionId: request.sessionId,
       data: request.data,
       mediaType: request.mediaType,
@@ -100,7 +109,7 @@ export class DshFileUploadPort implements FileUploadPort {
     readonly signal?: AbortSignal
     readonly name?: string
   }): Promise<StagedUpload> {
-    const result = await this.service.uploadStream({
+    const result = await this.service().uploadStream({
       sessionId: request.sessionId,
       data: request.data,
       ...(request.signal === undefined ? {} : { signal: request.signal }),
@@ -112,11 +121,18 @@ export class DshFileUploadPort implements FileUploadPort {
 
 /** Adapt `ctx.attachments` for outbound image normalization. */
 export class DshAttachmentPort implements AttachmentPort {
-  constructor(private readonly service: AttachmentsService) {}
+  private constructor(private readonly ctx: Context) {}
 
   static from(ctx: Context): DshAttachmentPort | undefined {
-    const service = optionalService<AttachmentsService>(ctx, 'attachments')
-    return service === undefined ? undefined : new DshAttachmentPort(service)
+    return optionalService<AttachmentsService>(ctx, 'attachments') === undefined
+      ? undefined
+      : new DshAttachmentPort(ctx)
+  }
+
+  private service(): AttachmentsService {
+    const service = optionalService<AttachmentsService>(this.ctx, 'attachments')
+    if (service === undefined) throw new Error('DSH attachment service is unavailable')
+    return service
   }
 
   saveImage(input: {
@@ -124,11 +140,11 @@ export class DshAttachmentPort implements AttachmentPort {
     readonly mediaType: string
     readonly name?: string
   }): Promise<unknown> {
-    return this.service.saveImage(input)
+    return this.service().saveImage(input)
   }
 
   readImage(ref: unknown, signal?: AbortSignal): Promise<{ readonly data: Uint8Array }> {
-    return this.service.readImage(ref, signal)
+    return this.service().readImage(ref, signal)
   }
 }
 

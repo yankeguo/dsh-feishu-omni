@@ -100,14 +100,15 @@ function payloadBudget(maxRequestBytes: number): number {
   return Math.max(1, maxRequestBytes - CARD_REQUEST_RESERVE_BYTES)
 }
 
-interface FenceInfo {
+export interface FenceInfo {
   readonly marker: string
   readonly info: string
 }
 
 const FENCE_OPEN = /^( {0,3})(`{3,}|~{3,})(.*)$/
 
-function openingFence(line: string): FenceInfo | undefined {
+/** CommonMark 0-3 space fenced-code opener shared with the inline-image rewriter. */
+export function openingFence(line: string): FenceInfo | undefined {
   const match = FENCE_OPEN.exec(line.endsWith('\r') ? line.slice(0, -1) : line)
   if (match === null) return undefined
   const marker = match[2] ?? ''
@@ -118,7 +119,8 @@ function openingFence(line: string): FenceInfo | undefined {
   return { marker, info }
 }
 
-function closesFence(line: string, fence: FenceInfo): boolean {
+/** Whether `line` closes `fence` (same marker character, not shorter, no info text). */
+export function closesFence(line: string, fence: FenceInfo): boolean {
   const match = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(line.endsWith('\r') ? line.slice(0, -1) : line)
   if (match === null) return false
   const marker = match[1] ?? ''
