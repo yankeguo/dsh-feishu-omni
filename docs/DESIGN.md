@@ -10,10 +10,10 @@
   - 卡片 JSON 2.0 必须显式声明 `"schema":"2.0"`，富文本组件为 `{"tag":"markdown","content":"..."}`，支持标题、强调、列表、引用、代码块、链接和表格；表格语法仅 2.0 支持。来源：[卡片 JSON 2.0 结构](https://open.feishu.cn/document/feishu-cards/card-json-v2-structure)、[富文本（Markdown）组件](https://open.feishu.cn/document/feishu-cards/card-json-v2-components/content-components/rich-text)。
   - 发送仍走 `POST /open-apis/im/v1/messages`：`msg_type=interactive`，`content` 为卡片 JSON 字符串。来源：[发送消息](https://open.feishu.cn/document/server-docs/im-v1/message/create)。
   - `uuid` 是请求级幂等键：相同 uuid 在 **1 小时**内至多成功发送一条消息，最大长度 50 字符；官方未按 `msg_type` 区分。因此 text 回退复用同一 uuid 不会与已落地的卡片重复。
-  - 卡片/富文本消息**请求体上限 30 KB**，超限业务码 `230025`；`230099` 是“创建卡片内容失败”的父码（常见子码 11310 表格数量超限、200621 JSON 解析失败、200861 2.0 使用 1.0 废弃 tag）；单 markdown 组件最多 4 个表格。注意“请求体”是 HTTP body：卡片 JSON 本身还要作为 `content` 字段再转义一层，所以不能只按卡片 JSON 大小估算。来源：[发送消息错误码](https://open.feishu.cn/document/server-docs/im-v1/message/create)、[通用错误码](https://open.feishu.cn/document/server-docs/api-call-guide/generic-error-code)。
+  - 卡片/富文本消息**请求体上限 30 KB**（文本消息 150 KB），超限业务码 `230025`；`230099` 是“创建卡片内容失败”的父码，官方 230099 子错误码表给出：`11310`（模板对应用不可见 / JSON 2.0 元素或组件超过 200 上限 / card action lock）、`200621`（卡片 JSON 解析失败）、`200861`（schema 2.0 使用了 1.0 支持而 2.0 不再支持的组件 tag）；**单 markdown 组件最多 4 个表格**来自[富文本（Markdown）组件](https://open.feishu.cn/document/feishu-cards/card-json-v2-components/content-components/rich-text)文档，官方子错误码表未给“表格数量超限”的明确子码。注意“请求体”是 HTTP body：卡片 JSON 本身还要作为 `content` 字段再转义一层，所以不能只按卡片 JSON 大小估算。来源：[发送消息错误码](https://open.feishu.cn/document/server-docs/im-v1/message/create)、[通用错误码](https://open.feishu.cn/document/server-docs/api-call-guide/generic-error-code)。
   - 卡片 JSON 2.0 需要飞书客户端 **7.20+**；更低版本标题正常、正文显示官方升级提示文案（不会降级成纯文本 Markdown）。来源：[卡片 JSON 2.0 版本更新说明](https://open.feishu.cn/document/uAjLw4CM/ukzMukzMukzM/feishu-cards/card-json-v2-breaking-changes-release-notes)。
-  - 限频：同一用户 5 QPS、同一群组内机器人共享 5 QPS、应用整体 1000 次/分与 50 次/秒，超限返回 HTTP 429（旧接口 400 + 99991400）。来源：[频控策略](https://open.feishu.cn/document/ukTMukTMukTM/uUzN04SN3QjL1cDN)。
-  - 参考部署 `dsh-im` 的生产常量也印证了保守预算：卡片 JSON ≤ 24 KB、其自身实测单卡表格 ≤ 5 个（官方 2.0 文档对单 markdown 组件的上限是 4 个表格，本插件以官方 4 个为准）。本插件按**请求体**估算 24 KB，并让小于预算的表格整块保留。
+  - 限频：发送消息接口文档写“向同一用户 5 QPS、向同一群组为群内机器人共享 5 QPS”，接口频率限制 1000 次/分与 50 次/秒。触发限流的响应随接口而异：本接口（`im/v1/messages`）错误码表是 **HTTP 400 + `230020`**；通用[频控策略](https://open.feishu.cn/document/ukTMukTMukTM/uUzN04SN3QjL1cDN)文档描述的是 **HTTP 429 + `99991400`**，并注明“部分旧版 OpenAPI 的 HTTP 状态码为 400”。另有消息域限流码 `11232`（创建消息触发系统超限）/`11233`（会话维度限流）/`11247`（请求触发频控），[服务端通用错误码](https://open.feishu.cn/document/server-docs/api-call-guide/generic-error-code)的排查建议均指向频控策略。插件对 `230020`/`11232`/`11233`/`11247`/`99991400` 都按“先识别限频业务码、再判 HTTP 4xx”的顺序处理为可重试。来源：[发送消息](https://open.feishu.cn/document/server-docs/im-v1/message/create)、[频控策略](https://open.feishu.cn/document/ukTMukTMukTM/uUzN04SN3QjL1cDN)、[服务端通用错误码](https://open.feishu.cn/document/server-docs/api-call-guide/generic-error-code)。
+  - 参考部署 `dsh-im` 的生产常量也印证了保守预算：卡片 JSON ≤ 24 KB、其自身实测单卡表格 ≤ 5 个（官方富文本组件文档对单 markdown 组件的上限是 4 个表格，本插件以官方 4 个为准）。本插件按**请求体**估算 24 KB，并让小于预算的表格整块保留。
 
 ## 2. 已核实的 DSH 扩展点
 
@@ -93,7 +93,7 @@ MVP 镜像：所有直接人类输入（飞书与 DSH Web）和 lead 的最终�
 - 非助手消息（用户镜像、`[DSH]`、测试消息）的 UUID 为 `dshfo_ + sha256(event key + chat_id)` 的前 40 个十六进制字符，总长度小于飞书 50 字符限制。重试复用 UUID，不同消息/收件人使用不同 UUID。
 - 助手卡片按分片派生 UUID：`event key + chat_id + part:<i>` 哈希后仍为 46 字符；同一分片的卡片重试与纯文本回退**共用同一个 UUID**，利用飞书“相同 UUID 1 小时内至多一条成功消息”的幂等语义防止重复。
 - Session prompt admission 与飞书发送默认都最多 3 次尝试，退避 500ms、1s（上限 5s）；prompt 重试复用 DSH `requestId`。最终 admission 失败会向原发送者回一条错误提示。
-- 429、408、425、5xx 和网络错误可重试；限频业务码 `230020`/旧接口 `400+99991400` 优先判为可重试；普通 4xx、认证终态和飞书业务码 `230002`（机器人不在目标会话）不重试。SDK 的非零响应会把业务 `code` 挂到 Error 上，供统一分类；其它未知业务码暂按可重试处理。
+- 429、408、425、5xx 和网络错误可重试；限频业务码 `230020`（本接口文档为 HTTP 400）、`11232`/`11233`/`11247`（消息域限流）与通用频控 `99991400`（HTTP 429，旧版接口 400）优先判为可重试；普通 4xx、认证终态和飞书业务码 `230002`（机器人不在目标会话）不重试。SDK 的非零响应会把业务 `code` 挂到 Error 上，供统一分类；其它未知业务码暂按可重试处理。
 - 发送失败保留绑定，继续下一个收件人；后续消息会再次尝试，所以重新把机器人加入会话后可恢复。状态显示最近脱敏错误。
 - 每次发送的 SDK `Client` 使用带 15 秒 timeout 和取消 signal 的独立 Axios 实例，所有 Client 共享一个 SDK token cache，按 appId 复用并提前刷新 tenant token；`WSClient` 负责自动重连和终态 `onError`。桥接另设 30 秒有界等待，停止时 AbortController 会取消 prompt、发送与退避，关闭操作同步阻止任何排队连接重新启动。
 - App ID 在保存时按 SDK 1.76.0 的实际规则校验：`cli_` 加 16 位十六进制字符，避免 SDK 只记录日志而 UI 永久停留在 connecting。插件显示 phase，终态可手动重新连接。
@@ -125,12 +125,12 @@ App Secret 仅存在于单次浏览器请求、Host 内存与 DSH credentials。
 6. `state.json` 是普通本机配置，不是加密数据库；Open ID、chat_id 和 Session ID 会明文保存。Secret 不在其中。
 7. 插件替换安装后的 Host JS 需要重启 DSH 才能加载新模块；人工验收由用户执行。
 8. 助手卡片依赖飞书客户端 **7.20+** 才能渲染 JSON 2.0 内容；按官方版本说明，旧客户端只显示标题和升级提示（真实旧客户端样式待人工验收）。这是换取列表/代码块/表格原生渲染的代价，插件不做版本探测，也不降级成纯文本 Markdown（那会回到本功能要修复的问题）。
-9. 官方文档明确单 markdown 组件最多 4 个表格；24 KB 请求体预算是按官方 30 KB 上限与参考实现推算的保守值。超出预算的长回复已分片，但单条分片内仍可能因 >4 个表格被飞书以 `230099` 拒绝并回退纯文本。真实租户的大表格回复需要人工验证。
+9. 官方富文本组件文档明确单 markdown 组件最多 4 个表格，但未给出“表格数量超限”的专属子码；24 KB 请求体预算是按官方 30 KB 上限与参考实现推算的保守值。超出预算的长回复已分片，但单条分片内仍可能因 >4 个表格被飞书拒绝（可能以 `230099` 呈现，自动测试不覆盖真实平台），届时按载荷拒绝路径同 UUID 回退纯文本。真实租户的大表格回复需要人工验证。
 10. 纯文本回退复用同一 UUID 依赖飞书“至少一次/至多一条”的幂等承诺；真实平台在“卡片已落地但响应丢失”场景下重发同 UUID 文本的具体响应（成功或去重错误）未在自动测试中验证，只保证不会出现两条消息的最佳努力。
 
 ## 8. 自动测试覆盖
 
-fake 测试覆盖：text/post 解析、非法事件、双键去重、prompt 失败重试、并发 FIFO、广播、completed turn 聚合、interrupted 片段与非 completed turn 抑制、DSH/DevLead source 过滤、永久飞书业务码与单收件人失败隔离、稳定 UUID 重试、永久 pending 请求取消、关闭时排队连接、状态原子保存/读取、损坏状态旁置、I/O 错误/非普通文件/超限文件不旁置、读取后按实际字节数复检超限（`stat` 与 `readFile` 之间文件增长）、旁置 rename 失败上抛、初始化前 `update()` 遇旁置恢复后以空状态继续、控制器恢复、并发状态更新、配置连接生命周期、Secret 脱敏、管理 envelope 校验、Client 两个设置 slot 与响应校验。助手卡片部分覆盖：卡片 JSON 2.0 结构与 `[助手]` 标题、单卡不拆分时原文逐字节保留、长回复分片数量/顺序/`(i/n)` 标记、分片 UUID 确定性、每片按含二次转义的请求体估算 ≤24 KB（普通文本与引号/反斜杠密集文本）、代码围栏闭合/重开与未闭合围栏补齐、单行硬切、CRLF 归一、自定义预算、小表格整块保留与大表按行切分不丢行、`230099` 拒绝后同 UUID 纯文本回退且不泄漏卡片 JSON、网络不确定结果同 UUID 重试与回退、`230020`/旧接口 400 限频码可重试、`230002` 永久错误不重试不回退、分片中途永久失败后停止该收件人其余分片、卡片路径 stop 取消、非助手消息仍为 `text`。另以真实 SDK `Client` / `WSClient` 加本地 Axios adapter（无网络）验证 tenant token、text 与 interactive 消息发送、WebSocket endpoint 和 `$return_headers` 的响应解包。
+fake 测试覆盖：text/post 解析、非法事件、双键去重、prompt 失败重试、并发 FIFO、广播、completed turn 聚合、interrupted 片段与非 completed turn 抑制、DSH/DevLead source 过滤、永久飞书业务码与单收件人失败隔离、稳定 UUID 重试、永久 pending 请求取消、关闭时排队连接、状态原子保存/读取、损坏状态旁置、I/O 错误/非普通文件/超限文件不旁置、读取后按实际字节数复检超限（`stat` 与 `readFile` 之间文件增长）、旁置 rename 失败上抛、初始化前 `update()` 遇旁置恢复后以空状态继续、控制器恢复、并发状态更新、配置连接生命周期、Secret 脱敏、管理 envelope 校验、Client 两个设置 slot 与响应校验。助手卡片部分覆盖：卡片 JSON 2.0 结构与 `[助手]` 标题、单卡不拆分时原文逐字节保留、长回复分片数量/顺序/`(i/n)` 标记、分片 UUID 确定性、每片按含二次转义的请求体估算 ≤24 KB（普通文本与引号/反斜杠密集文本）、代码围栏闭合/重开与未闭合围栏补齐、单行硬切、CRLF 归一、自定义预算、小表格整块保留与大表按行切分不丢行、`230099` 拒绝后同 UUID 纯文本回退且不泄漏卡片 JSON、网络不确定结果同 UUID 重试与回退、`230020`/旧接口 400 限频码与 `11232`/`11233`/`11247` 消息限流码（含 HTTP 400 包裹）可重试且回退分类为 `rejected`、`230002` 永久错误不重试不回退、分片中途永久失败后停止该收件人其余分片、卡片路径 stop 取消、非助手消息仍为 `text`。另以真实 SDK `Client` / `WSClient` 加本地 Axios adapter（无网络）验证 tenant token、text 与 interactive 消息发送、WebSocket endpoint 和 `$return_headers` 的响应解包。
 
 测试边界：`tests/host-adapters.spec.ts` 的 Cordis `Context` 和 Session Controller 全部是 mock，只验证本插件构造的 list/prompt 调用形状；安装版签名兼容性来自对目标 ASAR 源码的只读核对，不等同于真实 Host 集成测试。SDK 测试也只使用本地 HTTP adapter，不验证飞书实际权限、事件投递或 WebSocket 服务行为。依赖 `chmod` 权限位的用例在 root 与 Windows 上自动跳过，POSIX `0600` mode 断言在 Windows 上不执行（Windows 上 chmod 不阻止读取或改名，`stat` 的 mode 也是合成值）。
 
@@ -174,13 +174,13 @@ fake 测试覆盖：text/post 解析、非法事件、双键去重、prompt 失�
   4. 单行仍超预算时按 Unicode code point 边界硬切，不会切开代理对；
   5. 单元之间用空行拼接，并逐片校验转义字节数 ≤ 预算；任何异常超限再走硬切兜底，保证不丢内容。
 - 分片结果只依赖回复文本和常量，因此同一 turn 的重试、进程重启后的同 key 发送都会得到相同的分片与 UUID；分片条数不写入持久状态。
-- 已知取舍：只按段落/围栏切分，不解析列表内部结构，超长宽松列表被拆开时可能变成多个独立列表；小于预算的表格整块保留，超过预算的大表按行切开（第二片起不重复表头，渲染上会变成多个表格片段），若单卡仍出现 >4 个表格会被飞书拒绝并回退文本。
+- 已知取舍：只按段落/围栏切分，不解析列表内部结构，超长宽松列表被拆开时可能变成多个独立列表；小于预算的表格整块保留，超过预算的大表按行切开（第二片起不重复表头，渲染上会变成多个表格片段），若单卡仍出现 >4 个表格，可能被飞书拒绝（官方只规定 4 表格上限，未给明确子码；届时同 UUID 回退文本）。
 
 ### 顺序、限频与 UUID
 
 - 每个收件人内部按分片序号串行发送，收件人之间也串行（沿用全局 FIFO），同一回复的分片不会交错。
 - 分片 UUID = `uuidFor(event key + chat_id + ':part:' + i)`，46 字符，满足飞书 50 字符上限；卡片重试与文本回退共用同一 UUID。
-- 429 / `230020` / 旧接口 `400+99991400` 属于可重试码（先识别限频业务码，再判断 HTTP 4xx，避免把 400 包装的限频误判成不可重试），沿用指数退避（500ms、1s，上限 5s），没有额外引入分片间固定延迟。
+- 429 / `230020`（本接口 HTTP 400）/ `11232` / `11233` / `11247` / 旧接口 `400+99991400` 属于可重试码（先识别限频业务码，再判断 HTTP 4xx，避免把 400 包装的限频误判成不可重试），沿用指数退避（500ms、1s，上限 5s），没有额外引入分片间固定延迟。
 - 某收件人某片最终失败时停止该收件人剩余分片（避免缺片继续发），继续下一个收件人；已发出的分片不回滚。
 
 ### 失败分类与回退阶梯
@@ -190,7 +190,7 @@ fake 测试覆盖：text/post 解析、非法事件、双键去重、prompt 失�
 | 分类 | 判定 | 处理 |
 | --- | --- | --- |
 | `permanent` | 飞书业务码 `230002` / `99991661` / `99991663` / `99991664` | 不重试、不回退（换 text 也送不到） |
-| `rejected` | 其它飞书业务码（服务端已答复，消息未创建），或 4xx（408/425/429 除外） | `230001`/`230025`/`230099` 等载荷拒绝不重试，直接同 UUID 回退 text；其它可重试码按 `isRetryable` 退避 |
+| `rejected` | 其它飞书业务码（服务端已答复，消息未创建），或 4xx（408/425/429 除外） | `230001`/`230025`/`230099` 等载荷拒绝不重试，直接同 UUID 回退 text；限频类业务码 `230020`/`11232`/`11233`/`11247`/`99991400` 先按 `isRetryable` 指数退避，耗尽后同样同 UUID 回退 text |
 | `uncertain` | 无业务码的传输错误、超时、5xx、408/425/429 | 同 UUID 重试；耗尽后仍以同 UUID 回退 text |
 
 回退文本为 `[助手]\n<该片 markdown>`（多片时为 `[助手] (i/n)\n…`），绝不包含卡片 JSON。若回退 text 也失败，沿用原有 `sendWithRetry` 的错误上报与单收件人隔离。
@@ -201,4 +201,4 @@ fake 测试覆盖：text/post 解析、非法事件、双键去重、prompt 失�
 
 - 发送接口未变：`im:message:send_as_bot` 覆盖 `interactive`，`im:message.p2p_msg:readonly` 仍用于收消息。插件没有新增权限申请。
 - 旧客户端（<7.20）不渲染 JSON 2.0 正文：标题仍在，正文显示官方升级提示文案。插件不自动降级为 text，因为那正是本次要修复的“Markdown 显示为纯文本”问题；是否支持旧客户端应作为显式配置项，而不是默认行为。
-- 未验证项：真实租户下卡片首次发送的权限、真实旧客户端的升级提示样式、单卡 >4 个表格触发 `230099` 后的回退路径——均需人工验收。
+- 未验证项：真实租户下卡片首次发送的权限、真实旧客户端的升级提示样式、单卡 >4 个表格被拒绝（官方未给明确子码，可能为 `230099`）后的回退路径——均需人工验收。

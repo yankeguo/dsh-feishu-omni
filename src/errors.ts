@@ -48,11 +48,20 @@ const PERMANENT_PROVIDER_CODES = new Set([
 
 /**
  * Rate-limit codes that must stay retryable even when the response also carries
- * an HTTP 400 (older Feishu rate limiting reports 400 + 99991400/230020).
+ * an HTTP 400. Official docs: the send-message API lists HTTP 400 + `230020`
+ * ("This operation triggers the frequency limit"); the generic frequency-control
+ * guide uses HTTP 429 + `99991400` and notes that some legacy OpenAPIs answer
+ * with HTTP 400 instead; the server error-code reference lists `11232`/`11233`/
+ * `11247` as message-send rate limits and points back to the same frequency
+ * guide. All of them are transient by definition, so wait-and-retry with
+ * backoff is the documented remedy.
  */
 const RETRYABLE_PROVIDER_CODES = new Set([
-  230020,
-  99991400,
+  230020, // send message: current operation triggers the frequency limit (HTTP 400)
+  11232, // create message service trigger rate limit (message-service quota)
+  11233, // create message chat trigger rate limit (per-chat quota)
+  11247, // internal send message trigger rate limit (request frequency limit)
+  99991400, // generic OpenAPI frequency limit (HTTP 429, legacy APIs HTTP 400)
 ])
 
 /**
@@ -75,8 +84,9 @@ function httpStatusOf(error: unknown): number | undefined {
 
 export function isRetryable(error: unknown): boolean {
   const code = providerCode(error)
-  // Rate limiting must win over a wrapping HTTP 4xx: legacy Feishu rate limits
-  // surface as 400 + 99991400, which is transient, not a payload rejection.
+  // Rate limiting must win over a wrapping HTTP 4xx: Feishu rate limits surface
+  // as 429 + 99991400, 400 + 99991400/230020, or 400 + 11232/11233/11247, all
+  // transient rather than payload rejections.
   if (code !== undefined && RETRYABLE_PROVIDER_CODES.has(code)) return true
   const status = httpStatusOf(error)
   if (status !== undefined) {
@@ -93,9 +103,12 @@ export function isRetryable(error: unknown): boolean {
 export type DeliveryFailureKind =
   /** The provider answered with a permanent error; the message was not created. */
   | 'permanent'
-  /** The provider answered and rejected the payload; nothing was created. */
+  /**
+   * The provider answered with a non-permanent error (payload rejection or rate
+   * limit); the message was not created, so reusing its UUID is safe.
+   */
   | 'rejected'
-  /** No trustworthy answer (network, timeout, 5xx, rate limit); may have landed. */
+  /** No trustworthy answer (network, timeout, 5xx); the message may have landed. */
   | 'uncertain'
 
 /**
@@ -106,6 +119,10 @@ export type DeliveryFailureKind =
 export function deliveryFailureKind(error: unknown): DeliveryFailureKind {
   const code = providerCode(error)
   if (code !== undefined) {
+    // A business answer (including rate limits such as 230020/11232) proves the
+    // server created nothing. Retryable rate-limit codes are retried first by
+    // isRetryableDelivery; once those retries are exhausted the caller falls
+    // back with the same UUID, which official idempotency makes duplicate-safe.
     return PERMANENT_PROVIDER_CODES.has(code) ? 'permanent' : 'rejected'
   }
   const status = httpStatusOf(error)

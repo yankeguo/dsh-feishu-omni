@@ -26,6 +26,20 @@ describe('error safety and retry policy', () => {
     expect(isRetryableDelivery({ code: 99991400, response: { status: 400 } })).toBe(true)
   })
 
+  it('retries message-service rate-limit codes even when wrapped in HTTP 400', () => {
+    // 11232/11233/11247 are documented as message-send rate limits that point
+    // back to the frequency-control guide, so they must survive a wrapping 400.
+    for (const code of [11232, 11233, 11247]) {
+      expect(isRetryable({ code })).toBe(true)
+      expect(isRetryable({ code, response: { status: 400 } })).toBe(true)
+      expect(isRetryable({ code: 'ERR_BAD_REQUEST', response: { status: 400, data: { code } } })).toBe(true)
+      expect(isRetryableDelivery({ code, response: { status: 400 } })).toBe(true)
+      // The provider answered and created nothing, so the exhausted-retry
+      // fallback can reuse the same UUID for plain text without duplicating.
+      expect(deliveryFailureKind({ code, response: { status: 400 } })).toBe('rejected')
+    }
+  })
+
   it('classifies delivery failures for the card fallback ladder', () => {
     expect(deliveryFailureKind({ code: 230002 })).toBe('permanent')
     expect(deliveryFailureKind({ code: 230099 })).toBe('rejected')
