@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "飞书共享 Session",
+    "description": "让多个飞书用户复用同一个既有 DSH Session，并同步所有人类输入与助手正式回复。支持 App ID/App Secret、Session 绑定、长连接状态和测试消息。"
+  }
+}

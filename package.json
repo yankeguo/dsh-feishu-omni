@@ -1,0 +1,86 @@
+{
+  "name": "@yankeguo/dsh-feishu-omni",
+  "version": "0.1.0",
+  "description": "Share one existing DeepSeek Harness Session across Feishu users with synchronized human and assistant messages.",
+  "license": "MIT",
+  "type": "module",
+  "icon": "./icon.svg",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yankeguo/dsh-feishu-omni.git"
+  },
+  "homepage": "https://github.com/yankeguo/dsh-feishu-omni#readme",
+  "bugs": {
+    "url": "https://github.com/yankeguo/dsh-feishu-omni/issues"
+  },
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "docs",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-plugin-manager"
+      ]
+    }
+  },
+  "engines": {
+    "dsh": ">=0.2.2-rc.5 <0.3.0",
+    "node": ">=24.9"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && node scripts/build-client.mjs && node scripts/check-package.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint src tests scripts eslint.config.js vitest.config.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "verify": "pnpm run lint && pnpm run typecheck && pnpm run test && pnpm run build"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "1.76.0",
+    "axios": "1.16.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "~4.1.0",
+    "@deepseek-ai/dsh-api-session-controller": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-client-connection": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-client-locale": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-client-ui-renderer": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-client-ui-settings": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-client-ui-slots": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-credentials": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-session": "0.2.2-rc.5",
+    "@deepseek-ai/schemastery": "~3.19.0",
+    "@eslint/js": "^9.39.1",
+    "@types/node": "^24.0.0",
+    "@types/react": "^18.3.12",
+    "esbuild": "^0.28.2",
+    "eslint": "^9.39.1",
+    "react": "^18.3.1",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.48.1",
+    "vitest": "^4.1.11"
+  }
+}

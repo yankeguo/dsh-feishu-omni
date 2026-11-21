@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Feishu shared Session">
+  <rect width="64" height="64" rx="14" fill="#3370ff"/>
+  <path d="M13 16h27a7 7 0 0 1 7 7v12a7 7 0 0 1-7 7H29l-9 7v-7h-7a7 7 0 0 1-7-7V23a7 7 0 0 1 7-7Z" fill="#fff"/>
+  <path d="M35 29h16a6 6 0 0 1 6 6v9a6 6 0 0 1-6 6h-4v6l-8-6h-8a6 6 0 0 1-6-6v-3" fill="#bff0ff"/>
+  <path d="M17 25h20M17 32h14" stroke="#3370ff" stroke-width="4" stroke-linecap="round"/>
+</svg>
