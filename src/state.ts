@@ -224,8 +224,10 @@ export class FileStateStore implements StateStore {
         } catch (error) {
           // A quarantined recovery leaves the store usable with an empty state, so
           // a direct update() can continue on it (initialize() still surfaces the
-          // recovery to the UI). Every other load failure keeps propagating.
+          // recovery to the UI). Every other load failure keeps propagating, and a
+          // recovery error alone is not proof that this store is ready to write.
           if (!(error instanceof StateRecoveryError)) throw error
+          if (!this.loaded) throw error
         }
       }
       const result = this.queue.then(async () => {

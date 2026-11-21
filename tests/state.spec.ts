@@ -14,6 +14,9 @@ afterEach(async () => {
 /** chmod does not block reads/renames as root and is ignored on Windows. */
 const skipPermissionTests = process.getuid?.() === 0 || process.platform === 'win32'
 
+/** Node synthesizes file modes on Windows, so only POSIX hosts report the real 0600 bits. */
+const supportsPosixFileMode = process.platform !== 'win32'
+
 describe('state persistence', () => {
   it('round-trips non-secret configuration and bindings with a private file mode', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'dfo-state-'))
@@ -35,7 +38,7 @@ describe('state persistence', () => {
     expect(loaded.sessionId).toBe('session-shared')
     expect(loaded.bindings).toHaveLength(1)
     expect(loaded.autoConnect).toBe(true)
-    expect((await stat(path)).mode & 0o777).toBe(0o600)
+    if (supportsPosixFileMode) expect((await stat(path)).mode & 0o777).toBe(0o600)
     expect(await readFile(path, 'utf8')).not.toContain('appSecret')
   })
 
@@ -103,6 +106,23 @@ describe('state persistence', () => {
     expect(quarantined).toHaveLength(1)
     expect(await readFile(join(directory, quarantined[0] ?? ''), 'utf8')).toBe('{bad json')
     expect(JSON.parse(await readFile(path, 'utf8'))).toMatchObject({ sessionId: 'session-shared' })
+  })
+
+  it('rejects a recovery error when the store never became usable despite it', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'dfo-recovery-unready-'))
+    directories.push(directory)
+    const path = join(directory, 'state.json')
+    // update() continues past StateRecoveryError only because FileStateStore has
+    // already quarantined the file and left an empty state behind; a store that
+    // reports recovery without becoming ready must not be written to.
+    class UnreadyRecoveryStore extends FileStateStore {
+      override async load(): Promise<never> {
+        throw new StateRecoveryError(`${path}.corrupt-fixture`, new Error('corrupt'))
+      }
+    }
+    const store = new UnreadyRecoveryStore(path)
+    await expect(store.update(current => current)).rejects.toBeInstanceOf(StateRecoveryError)
+    expect(await readdir(directory)).toEqual([])
   })
 
   it.skipIf(skipPermissionTests)('propagates read I/O errors without quarantining the state file', async () => {
