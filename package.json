@@ -71,7 +71,7 @@
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "1.76.0",
-    "axios": "1.16.0"
+    "axios": "1.20.0"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "~4.1.0",
