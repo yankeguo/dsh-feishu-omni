@@ -1,3 +1,4 @@
+import { Readable } from 'node:stream'
 import * as Lark from '@larksuiteoapi/node-sdk'
 import type { AxiosRequestConfig, AxiosResponse, InternalAxiosRequestConfig } from 'axios'
 import { describe, expect, it } from 'vitest'
@@ -95,5 +96,56 @@ describe('SDK-compatible HTTP instance (local adapters only)', () => {
     } as AxiosRequestConfig)
     expect(result.data).toEqual({ code: 0 })
     expect(result.headers['x-fixture']).toBe('yes')
+  })
+})
+
+describe('SDK image/file endpoints (local adapters only)', () => {
+  it('routes image upload, file upload and message-resource download through the documented endpoints', async () => {
+    const http = createHttpInstance()
+    const requests: { url: string; method: string; params?: unknown }[] = []
+    const resourceBytes = Buffer.from('resource-body-fixture')
+    http.defaults.adapter = async config => {
+      const url = config.url ?? ''
+      requests.push({ url, method: config.method ?? '', params: config.params })
+      if (url.includes('/auth/v3/tenant_access_token/internal')) {
+        return response(config, { code: 0, msg: 'ok', tenant_access_token: 'fake-token', expire: 7200 })
+      }
+      if (url.includes('/open-apis/im/v1/images')) {
+        return response(config, { code: 0, msg: 'ok', data: { image_key: 'img_key_real' } })
+      }
+      if (url.includes('/open-apis/im/v1/files')) {
+        return response(config, { code: 0, msg: 'ok', data: { file_key: 'file_key_real' } })
+      }
+      if (url.includes('/resources/')) {
+        return response(config, Readable.from([resourceBytes]))
+      }
+      return response(config, { code: 0, msg: 'ok', data: {} })
+    }
+    const client = new Lark.Client({
+      appId: APP_ID, appSecret: 'secret-fixture', httpInstance: http, logger: quietLogger,
+    })
+    // `image.create`/`file.create` return the unwrapped inner data, not the envelope.
+    await expect(client.im.v1.image.create({
+      data: { image_type: 'message', image: Buffer.from([1, 2, 3]) },
+    })).resolves.toEqual({ image_key: 'img_key_real' })
+    await expect(client.im.v1.file.create({
+      data: { file_type: 'pdf', file_name: '报告.pdf', file: Buffer.from([4, 5]) },
+    })).resolves.toEqual({ file_key: 'file_key_real' })
+    const download = await client.im.v1.messageResource.get({
+      path: { message_id: 'om_fixture', file_key: 'img_key_fixture' },
+      params: { type: 'image' },
+    })
+    const chunks: Uint8Array[] = []
+    for await (const chunk of download.getReadableStream()) chunks.push(chunk)
+    expect(Buffer.concat(chunks)).toEqual(resourceBytes)
+
+    const imageRequest = requests.find(request => request.url.includes('/open-apis/im/v1/images'))
+    expect(imageRequest?.method).toBe('post')
+    const fileRequest = requests.find(request => request.url.includes('/open-apis/im/v1/files'))
+    expect(fileRequest?.method).toBe('post')
+    const resourceRequest = requests.find(request => request.url.includes('/resources/'))
+    expect(resourceRequest?.url).toContain('/open-apis/im/v1/messages/om_fixture/resources/img_key_fixture')
+    expect(resourceRequest?.method).toBe('get')
+    expect(resourceRequest?.params).toEqual({ type: 'image' })
   })
 })

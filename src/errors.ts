@@ -44,6 +44,38 @@ export function providerCode(error: unknown): number | undefined {
   return undefined
 }
 
+/** Structural view of one DSH `RemoteError` crossing the Session Controller face. */
+export interface RemoteFailureLike {
+  readonly code: string
+  readonly details?: unknown
+}
+
+/**
+ * Identify a DSH Remote failure by its stable code. Discrimination is
+ * structural (`isDSHRemoteError` + string `code`), never `instanceof`, because
+ * the error may cross module or realm copies.
+ */
+export function remoteFailureOf(value: unknown): RemoteFailureLike | undefined {
+  if (typeof value !== 'object' || value === null) return undefined
+  const record = value as { isDSHRemoteError?: unknown; code?: unknown; details?: unknown }
+  if (record.isDSHRemoteError !== true || typeof record.code !== 'string') return undefined
+  return { code: record.code, details: record.details }
+}
+
+/**
+ * Reason of a DSH prompt rejection caused by the attachment payload (for
+ * example `MODEL_DOES_NOT_SUPPORT_IMAGES`). Such a rejection is terminal: the
+ * same receipts and image bytes cannot be admitted by retrying.
+ */
+export function attachmentRejectionReason(error: unknown): string | undefined {
+  const failure = remoteFailureOf(error)
+  if (failure?.code !== 'session/attachment-invalid') return undefined
+  const details = typeof failure.details === 'object' && failure.details !== null
+    ? failure.details as { readonly reason?: unknown }
+    : undefined
+  return typeof details?.reason === 'string' && details.reason.trim() ? details.reason : 'UNKNOWN'
+}
+
 const PERMANENT_PROVIDER_CODES = new Set([
   230002, // The bot is outside the target chat; retrying cannot restore membership.
   99991661,

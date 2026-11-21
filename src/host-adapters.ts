@@ -2,7 +2,45 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import type { Context } from '@deepseek-ai/cordis'
 import type { SessionPromptRequest } from '@deepseek-ai/dsh-api-session-controller'
 import { CREDENTIAL_REF, type SessionOption } from './public.ts'
-import type { CredentialPort, PromptInput, SessionPort } from './types.ts'
+import type {
+  AttachmentPort, CredentialPort, FileUploadPort, PromptInput, SessionPort, StagedUpload,
+} from './types.ts'
+
+/** Raw DSH upload service face (typed structurally to avoid a hard optional dependency). */
+interface FileUploadsService {
+  uploadImageStream(request: {
+    readonly sessionId: unknown
+    readonly data: AsyncIterable<Uint8Array>
+    readonly mediaType: string
+    readonly signal?: AbortSignal
+    readonly name?: string
+  }): Promise<{ readonly receiptId: unknown; readonly image?: unknown }>
+  uploadStream(request: {
+    readonly sessionId: unknown
+    readonly data: AsyncIterable<Uint8Array>
+    readonly signal?: AbortSignal
+    readonly name?: string
+  }): Promise<{ readonly receiptId: unknown }>
+}
+
+/** Raw DSH attachment service face used for outbound image normalization. */
+interface AttachmentsService {
+  saveImage(input: {
+    readonly data: Uint8Array
+    readonly mediaType: string
+    readonly name?: string
+  }): Promise<unknown>
+  readImage(ref: unknown, signal?: AbortSignal): Promise<{ readonly data: Uint8Array }>
+}
+
+/** Read one optional Host service without failing plugin activation. */
+function optionalService<T>(ctx: Context, name: string): T | undefined {
+  try {
+    return ctx.get(name) as T | undefined
+  } catch {
+    return undefined
+  }
+}
 
 export class DshCredentialPort implements CredentialPort {
   private readonly ref = credentialRef(CREDENTIAL_REF)
@@ -19,6 +57,78 @@ export class DshCredentialPort implements CredentialPort {
 
   async configured(): Promise<boolean> {
     return (await this.ctx.credentials.describe(this.ref)).configured
+  }
+}
+
+/**
+ * Adapt `ctx.fileUploads` into the plugin's receipt staging port. The service is
+ * resolved structurally with `ctx.get` so a Host composition that mounts the
+ * Session Controller without attachments (e.g. a stripped test composition)
+ * degrades image/file input instead of failing plugin activation.
+ */
+export class DshFileUploadPort implements FileUploadPort {
+  private constructor(private readonly service: FileUploadsService) {}
+
+  static from(ctx: Context): DshFileUploadPort | undefined {
+    const service = optionalService<FileUploadsService>(ctx, 'fileUploads')
+    return service === undefined ? undefined : new DshFileUploadPort(service)
+  }
+
+  async uploadImageStream(request: {
+    readonly sessionId: string
+    readonly data: AsyncIterable<Uint8Array>
+    readonly mediaType: string
+    readonly signal?: AbortSignal
+    readonly name?: string
+  }): Promise<StagedUpload> {
+    const result = await this.service.uploadImageStream({
+      sessionId: request.sessionId,
+      data: request.data,
+      mediaType: request.mediaType,
+      ...(request.signal === undefined ? {} : { signal: request.signal }),
+      ...(request.name === undefined ? {} : { name: request.name }),
+    })
+    return {
+      receiptId: String(result.receiptId),
+      ...(result.image === undefined ? {} : { image: result.image }),
+    }
+  }
+
+  async uploadStream(request: {
+    readonly sessionId: string
+    readonly data: AsyncIterable<Uint8Array>
+    readonly signal?: AbortSignal
+    readonly name?: string
+  }): Promise<StagedUpload> {
+    const result = await this.service.uploadStream({
+      sessionId: request.sessionId,
+      data: request.data,
+      ...(request.signal === undefined ? {} : { signal: request.signal }),
+      ...(request.name === undefined ? {} : { name: request.name }),
+    })
+    return { receiptId: String(result.receiptId) }
+  }
+}
+
+/** Adapt `ctx.attachments` for outbound image normalization. */
+export class DshAttachmentPort implements AttachmentPort {
+  constructor(private readonly service: AttachmentsService) {}
+
+  static from(ctx: Context): DshAttachmentPort | undefined {
+    const service = optionalService<AttachmentsService>(ctx, 'attachments')
+    return service === undefined ? undefined : new DshAttachmentPort(service)
+  }
+
+  saveImage(input: {
+    readonly data: Uint8Array
+    readonly mediaType: string
+    readonly name?: string
+  }): Promise<unknown> {
+    return this.service.saveImage(input)
+  }
+
+  readImage(ref: unknown, signal?: AbortSignal): Promise<{ readonly data: Uint8Array }> {
+    return this.service.readImage(ref, signal)
   }
 }
 
@@ -39,11 +149,23 @@ export class DshSessionPort implements SessionPort {
   }
 
   async prompt(input: PromptInput, signal?: AbortSignal): Promise<void> {
+    const attachments = input.attachments ?? []
+    const content: SessionPromptRequest['content'] = attachments.length === 0
+      ? [{ type: 'text', text: input.text }]
+      : [
+          { type: 'text', text: input.text },
+          ...attachments.map(attachment => ({
+            type: 'file' as const,
+            // The receipt is minted by the same DSH composition; the brand is a
+            // compile-time marker only.
+            receiptId: attachment.receiptId as never,
+          })),
+        ]
     const request: SessionPromptRequest = {
       requestId: input.requestId as SessionPromptRequest['requestId'],
       sessionId: input.sessionId as SessionPromptRequest['sessionId'],
       mode: 'queue',
-      content: [{ type: 'text', text: input.text }],
+      content,
       clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
     }
     const timeout = AbortSignal.timeout(30_000)

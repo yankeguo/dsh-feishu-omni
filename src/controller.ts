@@ -4,7 +4,8 @@ import type { ConfigureInput, ConnectionPhase, OmniStatus, PublicError, SessionO
 import { SerialQueue } from './serial.ts'
 import { StateRecoveryError } from './state.ts'
 import type {
-  CredentialPort, FeishuGateway, GatewayFactory, SessionEventLike, SessionPort, StateStore,
+  AttachmentPort, CredentialPort, FeishuGateway, FileUploadPort, GatewayFactory, SessionEventLike,
+  SessionPort, StateStore,
 } from './types.ts'
 
 export interface OmniControllerOptions {
@@ -14,6 +15,10 @@ export interface OmniControllerOptions {
   readonly gatewayFactory: GatewayFactory
   readonly logger?: Logger
   readonly now?: () => Date
+  /** DSH attachment staging service for inbound images/files. */
+  readonly fileUploads?: FileUploadPort
+  /** DSH attachment store for outbound image normalization. */
+  readonly attachments?: AttachmentPort
 }
 
 /** Owns configuration transitions and the single live bridge generation. */
@@ -208,6 +213,8 @@ export class OmniController {
         gateway,
         logger: this.logger,
         now: this.now,
+        ...(this.options.fileUploads === undefined ? {} : { fileUploads: this.options.fileUploads }),
+        ...(this.options.attachments === undefined ? {} : { attachments: this.options.attachments }),
         onError: error => {
           if (generation === this.generation) this.rememberError(error)
         },

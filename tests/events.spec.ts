@@ -9,7 +9,7 @@ describe('Feishu event extraction', () => {
       kind: 'message',
       message: {
         eventId: 'event-1', messageId: 'om_1', openId: 'ou_alice', chatId: 'oc_alice',
-        label: '张三', text: '你好',
+        label: '张三', text: '你好', attachments: [],
       },
     })
   })
@@ -41,13 +41,87 @@ describe('Feishu event extraction', () => {
     if (result.kind === 'message') expect(result.message.text).toBe('标题\n第一行链接')
   })
 
+  it('collects post rich-text image nodes as image attachments', () => {
+    const event = feishuEvent()
+    Object.assign(event.message!, {
+      message_type: 'post',
+      content: JSON.stringify({
+        title: '图文',
+        content: [
+          [{ tag: 'text', text: '看这个' }],
+          [{ tag: 'img', image_key: 'img_v3_one' }, { tag: 'img', image_key: 'img_v3_two' }, { tag: 'img', image_key: 'img_v3_one' }],
+        ],
+      }),
+    })
+    const result = extractInboundMessage(event)
+    expect(result.kind).toBe('message')
+    if (result.kind === 'message') {
+      expect(result.message.text).toBe('图文\n看这个')
+      expect(result.message.attachments).toEqual([
+        { type: 'image', kind: 'image', key: 'img_v3_one' },
+        { type: 'image', kind: 'image', key: 'img_v3_two' },
+      ])
+    }
+  })
+
+  it('extracts image message content as one image attachment', () => {
+    const result = extractInboundMessage(feishuEvent({
+      messageType: 'image',
+      content: { image_key: 'img_v3_abc' },
+    }))
+    expect(result).toEqual({
+      kind: 'message',
+      message: {
+        eventId: 'event-1', messageId: 'om_1', openId: 'ou_alice', chatId: 'oc_alice',
+        label: '用户 ou_alice', text: '', attachments: [{ type: 'image', kind: 'image', key: 'img_v3_abc' }],
+      },
+    })
+  })
+
+  it('extracts file, audio and media content as file-like attachments', () => {
+    const file = extractInboundMessage(feishuEvent({
+      messageType: 'file',
+      content: { file_key: 'file_v3_pdf', file_name: '报告.pdf' },
+    }))
+    expect(file.kind).toBe('message')
+    if (file.kind === 'message') {
+      expect(file.message.attachments).toEqual([
+        { type: 'file', kind: 'file', key: 'file_v3_pdf', name: '报告.pdf' },
+      ])
+    }
+    const audio = extractInboundMessage(feishuEvent({
+      messageType: 'audio',
+      content: { file_key: 'file_v3_audio', duration: 3000 },
+    }))
+    expect(audio.kind).toBe('message')
+    if (audio.kind === 'message') {
+      expect(audio.message.attachments).toEqual([{ type: 'file', kind: 'audio', key: 'file_v3_audio' }])
+    }
+    const media = extractInboundMessage(feishuEvent({
+      messageType: 'media',
+      content: { file_key: 'file_v3_video', file_name: 'clip.mp4', duration: 3000, image_key: 'img_cover' },
+    }))
+    expect(media.kind).toBe('message')
+    if (media.kind === 'message') {
+      expect(media.message.attachments).toEqual([
+        { type: 'file', kind: 'media', key: 'file_v3_video', name: 'clip.mp4' },
+      ])
+    }
+  })
+
+  it('ignores messages whose resource key is missing instead of admitting an empty prompt', () => {
+    expect(extractInboundMessage(feishuEvent({ messageType: 'image', content: '{}' })))
+      .toEqual({ kind: 'ignored', reason: 'unsupported' })
+    expect(extractInboundMessage(feishuEvent({ messageType: 'file', content: { file_name: 'x.pdf' } })))
+      .toEqual({ kind: 'ignored', reason: 'unsupported' })
+  })
+
   it('ignores bots, groups, unsupported content and empty text', () => {
     expect(extractInboundMessage(feishuEvent({ senderType: 'bot' }))).toEqual({ kind: 'ignored', reason: 'bot' })
     expect(extractInboundMessage(feishuEvent({ chatType: 'group' }))).toEqual({ kind: 'ignored', reason: 'group' })
     expect(extractInboundMessage(feishuEvent({ text: '   ' }))).toEqual({ kind: 'ignored', reason: 'empty' })
-    const image = feishuEvent()
-    Object.assign(image.message!, { message_type: 'image', content: '{}' })
-    expect(extractInboundMessage(image)).toEqual({ kind: 'ignored', reason: 'unsupported' })
+    const sticker = feishuEvent({ messageType: 'sticker', content: { file_key: 'sticker_key' } })
+    expect(extractInboundMessage(sticker)).toEqual({ kind: 'ignored', reason: 'unsupported' })
   })
 
   it('rejects malformed events instead of admitting an undeduplicatable message', () => {

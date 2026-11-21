@@ -3,7 +3,7 @@ import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { OmniController } from './controller.ts'
-import { DshCredentialPort, DshSessionPort } from './host-adapters.ts'
+import { DshAttachmentPort, DshCredentialPort, DshFileUploadPort, DshSessionPort } from './host-adapters.ts'
 import { createLarkGatewayFactory } from './lark.ts'
 import { registerManagementRoute } from './management.ts'
 import { FileStateStore } from './state.ts'
@@ -29,12 +29,18 @@ export function defaultStatePath(): string {
 export async function apply(ctx: Context, rawConfig: Partial<Config> = {}): Promise<void> {
   const config = Config(rawConfig)
   const logger = ctx.logger(name)
+  // Attachment services are optional so a stripped Host composition still
+  // loads and degrades image/file input to a text notice instead of failing.
+  const fileUploads = DshFileUploadPort.from(ctx)
+  const attachments = DshAttachmentPort.from(ctx)
   const controller = new OmniController({
     state: new FileStateStore(config.statePath || defaultStatePath()),
     sessions: new DshSessionPort(ctx),
     credentials: new DshCredentialPort(ctx),
     gatewayFactory: createLarkGatewayFactory(),
     logger,
+    ...(fileUploads === undefined ? {} : { fileUploads }),
+    ...(attachments === undefined ? {} : { attachments }),
   })
   await controller.initialize()
   ctx.effect(() => registerManagementRoute(ctx, controller), 'feishu-omni: management route')
